@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -109,18 +111,134 @@ def test_on_off_help() -> None:
     assert "--socket" in result_off.output
 
 
-def test_config_show_without_engineer_a_module_exits_64(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Without A's config.py merged, ``config show`` exits 64 with an error."""
+def test_config_show_round_trips(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """``config show`` emits TOML that round-trips through ``load_config``.
+
+    This replaces an earlier exit-64 bridge-fallback assertion. It verifies
+    the production wiring: ``effective_toml(load_config(None))`` produces a
+    canonical TOML string that ``load_config`` will parse without loss.
+    """
+    # Point KASA_CLI_CONFIG at a path that doesn't exist so load_config falls
+    # back to built-in defaults rather than picking up the developer's real
+    # config.toml.
+    monkeypatch.delenv("KASA_CLI_CONFIG", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+
     runner = CliRunner()
-    result = runner.invoke(cli_main, ["--jsonl", "config", "show"])
-    assert result.exit_code == 64
+    result = runner.invoke(cli_main, ["--json", "config", "show"])
+    assert result.exit_code == 0, f"stderr: {result.stderr}"
+    # Output must be valid TOML — round-trip via tomllib.
+    import tomllib
+
+    parsed = tomllib.loads(result.stdout)
+    assert "defaults" in parsed
+    assert "credentials" in parsed
+    assert parsed["defaults"]["timeout_seconds"] == 5
 
 
-def test_auth_status_without_engineer_a_module_exits_64(
-    monkeypatch: pytest.MonkeyPatch,
+def test_auth_status_empty_cache_returns_empty_array(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """``auth status`` against an empty cache emits ``[]`` with exit 0.
+
+    Replaces an earlier exit-64 bridge-fallback assertion.
+    """
+    monkeypatch.setenv("KASA_CLI_CONFIG_DIR", str(tmp_path))
     runner = CliRunner()
-    result = runner.invoke(cli_main, ["--jsonl", "auth", "status"])
-    assert result.exit_code == 64
+    result = runner.invoke(cli_main, ["--json", "auth", "status"])
+    assert result.exit_code == 0, f"stderr: {result.stderr}"
+    parsed = json.loads(result.stdout)
+    assert parsed == []
+
+
+def test_config_flag_accepts_path_string(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """C3: ``--config <path>`` succeeds against a valid TOML file.
+
+    The previous bug: Click delivered ``--config`` as ``str``, but
+    ``config.load_config`` calls ``.exists()`` on it and crashes with
+    ``AttributeError``. We now coerce to ``Path`` at the boundary.
+    """
+    cfg_path = tmp_path / "test.toml"
+    cfg_path.write_text(
+        "[defaults]\ntimeout_seconds = 7\nconcurrency = 3\n",
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("KASA_CLI_CONFIG", raising=False)
+
+    runner = CliRunner()
+    result = runner.invoke(cli_main, ["--config", str(cfg_path), "--json", "list"])
+    assert result.exit_code == 0, f"stderr: {result.stderr}"
+
+
+def test_verbose_flag_emits_info_lines_to_stderr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """C5 / FR-39: ``-v`` produces at least one stderr line at INFO level."""
+    monkeypatch.delenv("KASA_CLI_CONFIG", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    runner = CliRunner()
+    # ``list`` with no config invokes load_config which logs an INFO line.
+    result = runner.invoke(cli_main, ["-v", "--json", "list"])
+    assert result.exit_code == 0
+    info_lines = [line for line in result.stderr.splitlines() if '"level":"INFO"' in line]
+    assert info_lines, f"expected at least one INFO line; got stderr: {result.stderr!r}"
+
+
+def test_per_device_credential_override_via_cli(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """C7 / FR-CRED-9: ``[devices.<alias>] credential_file`` is honored on info/on/off.
+
+    We construct a config with a per-device override, invoke ``info`` on that
+    alias, intercept the connect call, and assert the override credentials
+    were used in the resolver chain.
+    """
+    # Per-device credentials file — must be 0600.
+    perdev_creds = tmp_path / "perdev-creds.json"
+    perdev_creds.write_text(
+        json.dumps({"version": 1, "username": "perdev-user", "password": "perdev-pass"}),
+        encoding="utf-8",
+    )
+    os.chmod(perdev_creds, 0o600)
+
+    cfg_path = tmp_path / "test.toml"
+    cfg_path.write_text(
+        f"""[defaults]
+timeout_seconds = 1
+
+[devices.kitchen]
+ip = "192.168.99.99"
+credential_file = "{perdev_creds}"
+""",
+        encoding="utf-8",
+    )
+
+    captured: dict[str, Any] = {}
+
+    async def _fake_connect(*_args: Any, **kwargs: Any) -> Any:
+        cfg = kwargs.get("config")
+        creds = getattr(cfg, "credentials", None)
+        captured["username"] = getattr(creds, "username", None)
+        captured["password"] = getattr(creds, "password", None)
+        # Raise so we don't have to mock a full Device.
+        raise OSError("expected — we're checking the resolved creds, not the connect")
+
+    monkeypatch.setattr("kasa.Device.connect", _fake_connect)
+    # Avoid env-var bleed.
+    monkeypatch.delenv("KASA_USERNAME", raising=False)
+    monkeypatch.delenv("KASA_PASSWORD", raising=False)
+    monkeypatch.delenv("KASA_CLI_CONFIG", raising=False)
+
+    runner = CliRunner()
+    result = runner.invoke(cli_main, ["--config", str(cfg_path), "--jsonl", "info", "kitchen"])
+    # Connect was patched to raise; we only care that the per-device creds
+    # made it into the DeviceConfig before the failure.
+    assert result.exit_code != 0, (
+        f"expected non-zero exit; stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert captured.get("username") == "perdev-user", (
+        f"connect was {'never called' if not captured else 'called with wrong creds'}; "
+        f"captured={captured} stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert captured.get("password") == "perdev-pass"

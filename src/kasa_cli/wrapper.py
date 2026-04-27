@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import math
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
@@ -207,11 +208,16 @@ async def resolve_target(
             password=credentials.password or "",
         )
 
+    # python-kasa 0.10.2's DeviceConfig.timeout is typed ``int | None``;
+    # ``int(0.5)`` truncates to 0 and disables timeouts, so we ceil to a
+    # minimum of 1 second. The ``asyncio.wait_for`` outer guard still uses
+    # the original float for sub-second cancellation precision.
+    device_timeout = max(1, math.ceil(timeout))
     try:
         kdev = await asyncio.wait_for(
             kasa.Device.connect(
                 host=host,
-                config=kasa.DeviceConfig(host=host, credentials=creds, timeout=int(timeout)),
+                config=kasa.DeviceConfig(host=host, credentials=creds, timeout=device_timeout),
             ),
             timeout=timeout,
         )

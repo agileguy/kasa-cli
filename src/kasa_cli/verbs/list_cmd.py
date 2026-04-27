@@ -12,12 +12,11 @@ Order: aliases as defined in config (preserve insertion order).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from typing import Any
 
-import kasa
-
 from kasa_cli import wrapper
-from kasa_cli.errors import EXIT_SUCCESS
+from kasa_cli.errors import EXIT_SUCCESS, KasaCliError
 from kasa_cli.output import OutputMode, emit_stream, list_view_to_text
 from kasa_cli.wrapper import CredentialBundle
 
@@ -29,38 +28,39 @@ async def _probe_one(
     credentials: CredentialBundle,
     timeout: float,
 ) -> bool:
-    """Connect+update one device. ``False`` on any failure."""
+    """Connect+update one device. ``False`` on any failure.
+
+    R1 boundary: this verb does NOT import ``kasa.*`` directly. All
+    interaction with python-kasa goes through :mod:`kasa_cli.wrapper`.
+    """
     if not host:
         return False
+
+    def _config_lookup(_target: str) -> tuple[str | None, str | None]:
+        return host, alias or None
+
     try:
-        creds: kasa.Credentials | None = None
-        if credentials.is_present:
-            creds = kasa.Credentials(
-                username=credentials.username or "",
-                password=credentials.password or "",
-            )
-        kdev = await asyncio.wait_for(
-            kasa.Device.connect(
-                host=host,
-                config=kasa.DeviceConfig(host=host, credentials=creds, timeout=int(timeout)),
-            ),
+        kdev = await wrapper.resolve_target(
+            host,
+            config_lookup=_config_lookup,
+            credentials=credentials,
             timeout=timeout,
         )
+    except KasaCliError:
+        return False
     except Exception:
         return False
+
     try:
         return await wrapper.probe_alive(kdev, timeout=timeout)
     finally:
-        with _suppress_exc():
-            await kdev.disconnect()
-
-
-class _suppress_exc:  # noqa: N801 - tiny helper
-    def __enter__(self) -> None:
-        return None
-
-    def __exit__(self, *_args: object) -> bool:
-        return True
+        # The wrapper's resolve_target returns a connected python-kasa Device;
+        # disconnect is best-effort and must not propagate failures up to the
+        # liveness boolean.
+        disconnect = getattr(kdev, "disconnect", None)
+        if callable(disconnect):
+            with contextlib.suppress(Exception):
+                await disconnect()
 
 
 async def run_list(

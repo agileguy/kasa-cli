@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
 import stat
+import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -56,15 +59,27 @@ def test_cache_path_for_mac_normalizes_case_and_separators() -> None:
 
 
 def test_save_session_writes_atomically_with_chmod_0600() -> None:
+    """Save persists ``seed`` verbatim and stores expiry as wall-clock.
+
+    Per FR-CRED-6, the on-disk form uses ``_session_expire_at_wallclock``
+    (UNIX seconds) rather than the in-memory monotonic value, so the cache
+    survives process restarts. The non-temporal payload (``seed`` here)
+    round-trips byte-for-byte.
+    """
     state = {"_session_expire_at": time.monotonic() + 600, "seed": "abc"}
     auth_cache.save_session(MAC_A, state)
     path = auth_cache.cache_path_for_mac(MAC_A)
     assert path.exists()
     mode = stat.S_IMODE(path.stat().st_mode)
     assert mode == 0o600
-    # File content matches what we wrote (sorted keys, compact form).
     on_disk = json.loads(path.read_text())
-    assert on_disk == state
+    # Non-temporal payload is preserved verbatim.
+    assert on_disk["seed"] == "abc"
+    # Monotonic key is NOT persisted; wall-clock key replaces it.
+    assert auth_cache.EXPIRE_KEY not in on_disk
+    assert auth_cache.EXPIRE_KEY_WALLCLOCK in on_disk
+    # The wall-clock value is in the future (we saved expiry = now+600s).
+    assert on_disk[auth_cache.EXPIRE_KEY_WALLCLOCK] > time.time()
 
 
 def test_save_session_does_not_leave_tempfiles() -> None:
@@ -285,3 +300,46 @@ def test_locked_write_then_unlocked_read_round_trips() -> None:
     out = auth_cache.load_session(MAC_A)
     assert out is not None
     assert out["v"] == 1
+
+
+# ---------------------------------------------------------------------------
+# FR-CRED-6 cross-process round-trip
+# ---------------------------------------------------------------------------
+
+
+def test_session_expiry_survives_process_restart(tmp_path: Path) -> None:
+    """C4 / FR-CRED-6: a session written by one process is readable by another.
+
+    ``time.monotonic()`` is process-relative — its zero point does not
+    survive process restarts. Storing a monotonic timestamp on disk and
+    comparing it against a fresh process's ``time.monotonic()`` is
+    meaningless. This test runs two separate Python processes against the
+    same cache directory: process A writes a session with 60s of remaining
+    life, process B reads it and must NOT see it as expired.
+    """
+    env = {**os.environ, auth_cache.ENV_CONFIG_DIR: str(tmp_path)}
+
+    write_script = (
+        "import time\n"
+        "from kasa_cli import auth_cache\n"
+        "auth_cache.save_session("
+        "'AA:BB:CC:DD:EE:FF', "
+        "{'_session_expire_at': time.monotonic() + 60, 'data': 'hello'})\n"
+    )
+    subprocess.run(
+        [sys.executable, "-c", write_script],
+        check=True,
+        env=env,
+    )
+
+    read_script = (
+        "from kasa_cli import auth_cache\n"
+        "s = auth_cache.load_session('AA:BB:CC:DD:EE:FF')\n"
+        "print('hit' if s and s.get('data') == 'hello' else 'miss')\n"
+    )
+    out = subprocess.check_output(
+        [sys.executable, "-c", read_script],
+        env=env,
+        text=True,
+    ).strip()
+    assert out == "hit"

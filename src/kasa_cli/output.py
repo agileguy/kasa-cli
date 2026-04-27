@@ -200,9 +200,16 @@ def emit_error(
 
     Always emitted as JSON regardless of ``mode``. ``--quiet`` does NOT
     suppress structured errors — operators still need to know why the exit
-    code is non-zero. FR-35a is honored via ``_safe_dumps`` round-trip.
+    code is non-zero.
+
+    Uses :meth:`StructuredError.to_json` so null optional fields (``target``,
+    ``hint``) are omitted per SRD §11.2's example shape. FR-35a is enforced by
+    a defensive ``json.loads`` round-trip immediately before write — a
+    malformed payload raises rather than reaching stdout/stderr.
     """
+    del mode  # All modes emit the same JSON envelope.
     s = stream if stream is not None else sys.stderr
-    text = _safe_dumps(err, pretty=False)
+    text = err.to_json()
+    json.loads(text)  # FR-35a guard — never spew malformed JSON.
     s.write(text)
     s.write("\n")

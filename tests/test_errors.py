@@ -62,7 +62,7 @@ def test_exit_codes_are_unique() -> None:
         (errors.ConfigError, 6, "config_error"),
         (errors.PartialFailureError, 7, "partial_failure"),
         (errors.UsageError, 64, "usage_error"),
-        (errors.InterruptedError, 130, "interrupted"),
+        (errors.KasaInterruptError, 130, "interrupted"),
     ],
 )
 def test_exception_class_attributes(
@@ -179,6 +179,6 @@ def test_structured_error_names_are_documented() -> None:
         errors.ConfigError,
         errors.PartialFailureError,
         errors.UsageError,
-        errors.InterruptedError,
+        errors.KasaInterruptError,
     ):
         assert cls.error_name in closed_names

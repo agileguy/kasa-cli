@@ -216,8 +216,14 @@ class UsageError(KasaCliError):
     error_name = "usage_error"
 
 
-class InterruptedError(KasaCliError):
-    """SIGINT/SIGTERM during execution. Exit 130 or 143 — caller picks."""
+class KasaInterruptError(KasaCliError):
+    """SIGINT/SIGTERM during execution. Exit 130 or 143 — caller picks.
+
+    Renamed from ``InterruptedError`` to avoid shadowing the Python builtin
+    of the same name (an ``OSError`` subclass). Importing
+    ``kasa_cli.errors.InterruptedError`` would silently mask the builtin
+    inside this module's namespace.
+    """
 
     exit_code = EXIT_SIGINT
     error_name = "interrupted"
@@ -239,8 +245,8 @@ __all__ = [
     "AuthError",
     "ConfigError",
     "DeviceError",
-    "InterruptedError",
     "KasaCliError",
+    "KasaInterruptError",
     "NetworkError",
     "NotFoundError",
     "PartialFailureError",

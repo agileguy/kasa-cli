@@ -6,17 +6,17 @@ Phase 1 implements:
 * ``list``       — print configured aliases and groups
 * ``info``       — show full state of one target
 * ``on``  / ``off`` — power control with multi-socket gating
-* ``config show`` / ``config validate`` — stubs that delegate to Engineer A's
-  ``config.py`` (lazy-imported); if A's module is not present we exit 64
-  with a clear message
-* ``auth status`` / ``auth flush`` — stubs that delegate to Engineer A's
-  ``auth_cache.py``; same lazy-import behavior
+* ``config show`` / ``config validate`` — wired directly to ``config.effective_toml``
+  and ``config.validate_config``
+* ``auth status`` / ``auth flush`` — wired directly to ``auth_cache.list_sessions``
+  / ``flush_all`` / ``flush_one``
 
 The top-level group:
 
 * maps every :class:`KasaCliError` subclass to its fixed exit code,
 * installs SIGINT/SIGTERM handlers (Phase 1: just convert to exit 130/143;
   the full graceful-drain behavior of FR-31c is Phase 3),
+* configures stderr JSON-line logging (`-v` → INFO, `-vv` → DEBUG, default WARNING),
 * falls back to exit 1 with a generic StructuredError on uncaught exceptions.
 """
 
@@ -24,14 +24,19 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import importlib
+import logging
+import os
 import signal
 import sys
 from collections.abc import Callable, Coroutine
+from pathlib import Path
 from typing import Any
 
 import click
 
+from kasa_cli import auth_cache
+from kasa_cli.config import Config, effective_toml, load_config, validate_config
+from kasa_cli.credentials import ENV_PASSWORD, ENV_USERNAME, resolve_credentials
 from kasa_cli.errors import (
     EXIT_SIGINT,
     EXIT_SIGTERM,
@@ -42,24 +47,8 @@ from kasa_cli.errors import (
     StructuredError,
     UsageError,
 )
-from kasa_cli.output import OutputMode, detect_mode, emit_error
+from kasa_cli.output import OutputMode, detect_mode, emit_error, emit_stream
 from kasa_cli.wrapper import CredentialBundle
-
-# --- Lazy imports of Engineer A's modules -------------------------------------
-
-
-def _import_optional(name: str) -> Any | None:
-    """Return ``importlib.import_module`` result, or None if missing.
-
-    Used so this CLI can compile and run smoke tests before Engineer A's
-    branch is merged. Production runs should always have these modules
-    present; the merge-time PM step asserts it.
-    """
-    try:
-        return importlib.import_module(f"kasa_cli.{name}")
-    except ImportError:
-        return None
-
 
 # --- Common error envelopes ---------------------------------------------------
 
@@ -173,94 +162,96 @@ def _run_async(
 
 def _resolve_credentials(
     source: str | None,
-    config: Any | None = None,
+    config: Config | None = None,
     alias: str | None = None,
 ) -> CredentialBundle:
-    """Resolve a CredentialBundle using Engineer A's resolver.
+    """Resolve a CredentialBundle using ``credentials.resolve_credentials``.
 
     ``source`` is the value from ``--credential-source``:
     - ``none``: skip resolution; KLAP devices will fail with auth-required errors.
-    - ``env``: only honor ``KASA_USERNAME`` / ``KASA_PASSWORD``.
+    - ``env``: only honor ``KASA_USERNAME`` / ``KASA_PASSWORD``; both must be set
+      (matches A's resolver's "both or neither" invariant — R4).
     - ``file`` or ``None``: walk the full per-target → env → file chain.
-
-    ``config`` is required when ``source`` is anything other than ``none`` or
-    ``env`` so A's resolver can find the default credentials file path.
     """
     if source == "none":
         return CredentialBundle()
 
     if source == "env":
         # Strict env-only path: do not consult the file resolver.
-        import os
+        # R4: both-or-neither — partial bundles are not produced.
+        u = os.environ.get(ENV_USERNAME)
+        p = os.environ.get(ENV_PASSWORD)
+        if u and p:
+            return CredentialBundle(username=u, password=p)
+        return CredentialBundle()
 
-        return CredentialBundle(
-            username=os.environ.get("KASA_USERNAME"),
-            password=os.environ.get("KASA_PASSWORD"),
-        )
-
-    creds_mod = _import_optional("credentials")
-    if creds_mod is not None and hasattr(creds_mod, "resolve_credentials"):
-        if config is None:
-            cfg_mod = _import_optional("config")
-            if cfg_mod is not None and hasattr(cfg_mod, "load_config"):
-                try:
-                    config = cfg_mod.load_config(None)
-                except Exception as exc:
-                    raise ConfigError(
-                        f"Credential resolution failed: cannot load config: {exc}",
-                    ) from exc
+    if config is None:
         try:
-            resolved = creds_mod.resolve_credentials(config, alias=alias)
+            config = load_config(None)
+        except KasaCliError:
+            raise
         except Exception as exc:
             raise ConfigError(
-                f"Credential resolution failed: {exc}",
-                hint="Check ~/.config/kasa-cli/credentials and KASA_USERNAME/KASA_PASSWORD.",
+                f"Credential resolution failed: cannot load config: {exc}",
             ) from exc
-        if resolved is None:
-            return CredentialBundle()
-        if isinstance(resolved, CredentialBundle):
-            return resolved
-        if isinstance(resolved, dict):
-            return CredentialBundle(
-                username=resolved.get("username"),
-                password=resolved.get("password"),
-            )
-        if hasattr(resolved, "username") and hasattr(resolved, "password"):
-            return CredentialBundle(
-                username=getattr(resolved, "username", None),
-                password=getattr(resolved, "password", None),
-            )
+
+    try:
+        resolved = resolve_credentials(config, alias=alias)
+    except KasaCliError:
+        raise
+    except Exception as exc:
         raise ConfigError(
-            "credentials.resolve_credentials returned an unexpected shape",
-        )
+            f"Credential resolution failed: {exc}",
+            hint=f"Check ~/.config/kasa-cli/credentials and {ENV_USERNAME}/{ENV_PASSWORD}.",
+        ) from exc
 
-    # Final fallback when A's modules aren't available at all (degraded mode).
-    import os
-
-    return CredentialBundle(
-        username=os.environ.get("KASA_USERNAME"),
-        password=os.environ.get("KASA_PASSWORD"),
-    )
+    if resolved is None:
+        return CredentialBundle()
+    return CredentialBundle(username=resolved.username, password=resolved.password)
 
 
-def _load_config(config_path: str | None) -> Any | None:
-    """Load Engineer A's Config object, or return None.
+def _load_config(config_path: str | None) -> Config:
+    """Load the active Config, converting a string CLI path to ``Path``.
 
-    The CLI keeps working in degraded mode (no aliases, no groups) when the
-    config module is absent; targets must then be IPs.
+    Click delivers ``--config`` as a string; ``config.load_config`` requires
+    ``Path | None`` (it calls ``.exists()``). We coerce at the boundary so
+    the entire codebase below works exclusively with ``Path``.
     """
-    cfg_mod = _import_optional("config")
-    if cfg_mod is None:
-        return None
-    if hasattr(cfg_mod, "load_config"):
-        return cfg_mod.load_config(config_path)
-    if hasattr(cfg_mod, "Config") and hasattr(cfg_mod.Config, "load"):
-        return cfg_mod.Config.load(config_path)
-    return None
+    path: Path | None = Path(config_path).expanduser() if config_path else None
+    return load_config(path)
+
+
+def _configure_logging(verbose: int) -> None:
+    """Wire ``-v`` / ``-vv`` to a stderr JSON-line StreamHandler (FR-39).
+
+    Default is WARNING (silent on success), ``-v`` lifts to INFO, ``-vv`` to
+    DEBUG. The handler emits one JSON-shaped line per record so log output
+    is machine-parseable. Re-entrant safe — clears prior handlers if
+    ``main()`` is invoked twice within the same process (tests do this).
+    """
+    if verbose >= 2:
+        level = logging.DEBUG
+    elif verbose == 1:
+        level = logging.INFO
+    else:
+        level = logging.WARNING
+
+    handler = logging.StreamHandler(sys.stderr)
+    fmt = '{"ts":"%(asctime)s","level":"%(levelname)s","logger":"%(name)s","msg":"%(message)s"}'
+    handler.setFormatter(logging.Formatter(fmt))
+    root = logging.getLogger("kasa_cli")
+    root.setLevel(level)
+    for h in list(root.handlers):
+        root.removeHandler(h)
+    root.addHandler(handler)
+    # Keep propagation enabled so test fixtures (caplog) still receive records.
+    # The root logger has no default handler, so propagation is a no-op for
+    # ordinary CLI use unless the user has installed one.
+    root.propagate = True
 
 
 def _make_config_lookup(
-    cfg: Any | None,
+    cfg: Config | None,
 ) -> Callable[[str], tuple[str | None, str | None]]:
     """Build a config_lookup closure expected by wrapper.resolve_target."""
 
@@ -279,42 +270,26 @@ def _make_config_lookup(
                     return result
                 if hasattr(result, "ip"):
                     return getattr(result, "ip", None), getattr(result, "alias", None)
-        # Plain dict-of-devices fallback.
+        # Plain dict-of-devices fallback. Supports both dict-shaped entries
+        # (test fakes) and dataclass-shaped DeviceEntry (production Config).
         devices = getattr(cfg, "devices", None)
         if isinstance(devices, dict) and target in devices:
             entry = devices[target]
-            return entry.get("ip"), target
+            ip = entry.get("ip") if isinstance(entry, dict) else getattr(entry, "ip", None)
+            return ip, target
         return target, None
 
     return lookup
 
 
-def _devices_section(cfg: Any | None) -> list[dict[str, Any]]:
+def _devices_section(cfg: Config | None) -> list[dict[str, Any]]:
     """Produce a list-of-dicts shaped {alias, ip, mac} from the Config."""
     if cfg is None:
         return []
-    devices = getattr(cfg, "devices", None)
-    if isinstance(devices, dict):
-        out: list[dict[str, Any]] = []
-        for alias, entry in devices.items():
-            if isinstance(entry, dict):
-                out.append(
-                    {
-                        "alias": alias,
-                        "ip": entry.get("ip"),
-                        "mac": entry.get("mac"),
-                    }
-                )
-            else:
-                out.append(
-                    {
-                        "alias": alias,
-                        "ip": getattr(entry, "ip", None),
-                        "mac": getattr(entry, "mac", None),
-                    }
-                )
-        return out
-    return []
+    out: list[dict[str, Any]] = []
+    for alias, entry in cfg.devices.items():
+        out.append({"alias": alias, "ip": entry.ip, "mac": entry.mac})
+    return out
 
 
 # --- Click group --------------------------------------------------------------
@@ -349,6 +324,7 @@ def main(
         # FR-33 / FR-34 are mutually exclusive in spirit. Fail fast.
         click.echo("error: --json and --jsonl are mutually exclusive", err=True)
         ctx.exit(EXIT_USAGE_ERROR)
+    _configure_logging(verbose)
     mode = detect_mode(json_flag=json_flag, jsonl_flag=jsonl_flag, quiet=quiet)
     ctx.obj = {
         "mode": mode,
@@ -373,7 +349,8 @@ def main(
 def discover_cmd(ctx: click.Context, *, target_network: str | None) -> None:
     """Broadcast probe both protocol families and print responders."""
     state = ctx.obj
-    creds = _resolve_credentials(state["credential_source"])
+    cfg = _load_config(state["config_path"])
+    creds = _resolve_credentials(state["credential_source"], config=cfg)
 
     from kasa_cli.verbs.discover_cmd import run_discover
 
@@ -414,21 +391,20 @@ def list_cmd(
     """Print configured aliases (and optional liveness)."""
     state = ctx.obj
     cfg = _load_config(state["config_path"])
-    creds = _resolve_credentials(state["credential_source"])
+    creds = _resolve_credentials(state["credential_source"], config=cfg)
 
     if groups_flag:
         # FR-7: groups listing. Phase-1 minimal: print group names + members.
-        groups = getattr(cfg, "groups", None) or {}
-        from kasa_cli.output import emit_stream as _emit_stream
-
-        items: list[dict[str, Any]] = [{"name": k, "members": list(v)} for k, v in groups.items()]
+        items: list[dict[str, Any]] = [
+            {"name": k, "members": list(v)} for k, v in cfg.groups.items()
+        ]
 
         def _fmt_group(g: object) -> str:
             assert isinstance(g, dict)
             members = g.get("members", [])
             return f"{g.get('name', '')}: " + ", ".join(members)
 
-        _emit_stream(items, state["mode"], formatter=_fmt_group)
+        emit_stream(items, state["mode"], formatter=_fmt_group)
         sys.exit(EXIT_SUCCESS)
 
     devices = _devices_section(cfg)
@@ -460,7 +436,7 @@ def info_cmd(ctx: click.Context, *, target: str) -> None:
     """Show full live state of one target."""
     state = ctx.obj
     cfg = _load_config(state["config_path"])
-    creds = _resolve_credentials(state["credential_source"])
+    creds = _resolve_credentials(state["credential_source"], config=cfg, alias=target)
 
     from kasa_cli.verbs.info_cmd import run_info
 
@@ -487,7 +463,7 @@ def _onoff_command(action: str) -> Callable[..., None]:
     def _impl(ctx: click.Context, *, target: str, socket_arg: str | None) -> None:
         state = ctx.obj
         cfg = _load_config(state["config_path"])
-        creds = _resolve_credentials(state["credential_source"])
+        creds = _resolve_credentials(state["credential_source"], config=cfg, alias=target)
 
         from kasa_cli.verbs.onoff import run_onoff
 
@@ -512,42 +488,6 @@ main.command("on", help="Turn the device on.")(_onoff_command("on"))
 main.command("off", help="Turn the device off.")(_onoff_command("off"))
 
 
-# --- config / auth sub-verb helpers -------------------------------------------
-
-
-def _require_engineer_a_attr(
-    ctx: click.Context,
-    *,
-    module_name: str,
-    attr_name: str,
-    sub_verb: str,
-) -> Any:
-    """Lazy-load Engineer A's module and return ``attr_name``.
-
-    If the module isn't merged yet (or doesn't yet expose the attribute), emit
-    a structured ``unsupported_feature`` error and exit 64. Centralizing this
-    keeps the four sub-verbs (config show/validate, auth status/flush)
-    consistent and shrinks the surface area for stale messages.
-    """
-    state = ctx.obj
-    mod = _import_optional(module_name)
-    fn = getattr(mod, attr_name, None) if mod is not None else None
-    if fn is None:
-        err = StructuredError(
-            error="unsupported_feature",
-            exit_code=EXIT_USAGE_ERROR,
-            target=None,
-            message=(
-                f"{sub_verb} is not yet wired up — Engineer A's "
-                f"{module_name}.py must expose {attr_name}()."
-            ),
-            hint="Re-run after the Phase 1 merge.",
-        )
-        emit_error(err, state["mode"])
-        sys.exit(EXIT_USAGE_ERROR)
-    return fn
-
-
 # --- config show / config validate --------------------------------------------
 
 
@@ -560,13 +500,13 @@ def config_group() -> None:
 @click.pass_context
 def config_show(ctx: click.Context) -> None:
     """Print the effective resolved config in TOML."""
-    fn = _require_engineer_a_attr(
-        ctx,
-        module_name="config",
-        attr_name="render_effective_toml",
-        sub_verb="config show",
-    )
-    click.echo(fn(ctx.obj["config_path"]))
+    state = ctx.obj
+    try:
+        cfg = _load_config(state["config_path"])
+    except KasaCliError as exc:
+        emit_error(_to_structured(exc), state["mode"])
+        sys.exit(exc.exit_code)
+    click.echo(effective_toml(cfg), nl=False)
     sys.exit(EXIT_SUCCESS)
 
 
@@ -575,15 +515,19 @@ def config_show(ctx: click.Context) -> None:
 @click.pass_context
 def config_validate(ctx: click.Context, *, path: str | None) -> None:
     """Validate a config file and exit 0 (ok) or 6 (error)."""
-    fn = _require_engineer_a_attr(
-        ctx,
-        module_name="config",
-        attr_name="validate_config",
-        sub_verb="config validate",
-    )
     state = ctx.obj
+    candidate = path or state["config_path"]
+    if candidate is None:
+        err = StructuredError(
+            error="usage_error",
+            exit_code=EXIT_USAGE_ERROR,
+            target=None,
+            message="config validate requires a path (positional or --config).",
+        )
+        emit_error(err, state["mode"])
+        sys.exit(EXIT_USAGE_ERROR)
     try:
-        fn(path or state["config_path"])
+        validate_config(Path(candidate).expanduser())
         sys.exit(EXIT_SUCCESS)
     except KasaCliError as exc:
         emit_error(_to_structured(exc), state["mode"])
@@ -598,19 +542,30 @@ def auth_group() -> None:
     """Authentication / session-cache sub-verbs."""
 
 
+def _session_metadata_to_dict(meta: auth_cache.SessionMetadata) -> dict[str, Any]:
+    """Project a SessionMetadata row into a JSON-emittable dict."""
+    return {
+        "mac": meta.mac,
+        "path": str(meta.path),
+        "mtime_epoch": meta.mtime_epoch,
+        "bytes_size": meta.bytes_size,
+        "expires_at_monotonic": meta.expires_at_monotonic,
+    }
+
+
+def _session_metadata_to_text(meta: object) -> str:
+    """One-line text rendering of a SessionMetadata row."""
+    if isinstance(meta, dict):
+        return f"{meta.get('mac', '-')}  {meta.get('path', '-')}  {meta.get('bytes_size', 0)}B"
+    return str(meta)
+
+
 @auth_group.command("status")
 @click.pass_context
 def auth_status(ctx: click.Context) -> None:
     """Print cached KLAP session metadata (one line per device)."""
-    fn = _require_engineer_a_attr(
-        ctx,
-        module_name="auth_cache",
-        attr_name="auth_status",
-        sub_verb="auth status",
-    )
-    from kasa_cli.output import emit_stream
-
-    emit_stream(list(fn()), ctx.obj["mode"], formatter=str)
+    rows = [_session_metadata_to_dict(m) for m in auth_cache.list_sessions()]
+    emit_stream(rows, ctx.obj["mode"], formatter=_session_metadata_to_text)
     sys.exit(EXIT_SUCCESS)
 
 
@@ -619,13 +574,10 @@ def auth_status(ctx: click.Context) -> None:
 @click.pass_context
 def auth_flush(ctx: click.Context, *, target: str | None) -> None:
     """Delete all (or one device's) cached KLAP session state."""
-    fn = _require_engineer_a_attr(
-        ctx,
-        module_name="auth_cache",
-        attr_name="flush_sessions",
-        sub_verb="auth flush",
-    )
-    deleted = fn(target=target)
+    if target is not None:
+        deleted = 1 if auth_cache.flush_one(target) else 0
+    else:
+        deleted = auth_cache.flush_all()
     click.echo(f"flushed {deleted} session file(s)")
     sys.exit(EXIT_SUCCESS)
 

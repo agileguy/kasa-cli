@@ -184,6 +184,24 @@ def test_emit_error_quiet_still_writes_to_stderr() -> None:
     json.loads(sink.getvalue())
 
 
+def test_emit_error_omits_null_fields_in_json() -> None:
+    """C6 / SRD §11.2: ``target`` and ``hint`` keys are absent when None."""
+    err = StructuredError(
+        error="device_error",
+        exit_code=1,
+        message="something broke",
+        # target and hint default to None — must be omitted.
+    )
+    buf = io.StringIO()
+    emit_error(err, OutputMode.JSON, stream=buf)
+    parsed = json.loads(buf.getvalue())
+    assert "target" not in parsed
+    assert "hint" not in parsed
+    assert parsed["error"] == "device_error"
+    assert parsed["exit_code"] == 1
+    assert parsed["message"] == "something broke"
+
+
 # --- formatters smoke tests ---------------------------------------------------
 
 

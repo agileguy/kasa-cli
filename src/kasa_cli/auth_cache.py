@@ -56,10 +56,17 @@ TOKENS_SUBDIR: Final[str] = ".tokens"
 DIR_MODE: Final[int] = 0o700
 FILE_MODE: Final[int] = 0o600
 
-# Key in the cached JSON under which python-kasa's monotonic-clock expire
-# timestamp lives. The wrapper layer (Engineer B) is responsible for putting
-# the right value here when it serializes the KlapTransport state.
+# In-memory key (monotonic clock) — what python-kasa's KlapTransport carries
+# in its session state. Callers (the wrapper layer) read/write this value.
 EXPIRE_KEY: Final[str] = "_session_expire_at"
+
+# On-disk key (wall-clock seconds since UNIX epoch). ``time.monotonic()`` is
+# process-relative — its zero point does not survive process restarts — so we
+# CANNOT persist a monotonic value across CLI invocations. ``save_session``
+# translates monotonic→wall-clock on write; ``load_session`` translates back
+# to a fresh monotonic on read so the wrapper layer keeps using the same key.
+# (FR-CRED-6.)
+EXPIRE_KEY_WALLCLOCK: Final[str] = "_session_expire_at_wallclock"
 
 # In-process advisory mutex for tests on platforms where fcntl.flock against
 # a file held by *the same process* will not block. The OS-level flock still
@@ -144,15 +151,23 @@ def save_session(mac: str, state: dict[str, Any]) -> None:
     file gets ``0o600``. Caller MUST hold :func:`lock_for_write` for the same
     MAC for the duration of the surrounding read-modify-write transaction
     (FR-CRED-10).
+
+    On-disk schema: any incoming ``_session_expire_at`` (monotonic seconds —
+    python-kasa's native form) is translated to a wall-clock UNIX timestamp
+    stored under :data:`EXPIRE_KEY_WALLCLOCK`. The monotonic key is removed
+    from the persisted form. ``load_session`` reverses the translation so
+    callers continue to receive the monotonic key they expect.
     """
     target = cache_path_for_mac(mac)
     target.parent.mkdir(parents=True, exist_ok=True)
+
+    on_disk = _to_disk_form(dict(state))
 
     tmp_fd, tmp_path_str = _make_tempfile(target)
     tmp_path = Path(tmp_path_str)
     try:
         with os.fdopen(tmp_fd, "w", encoding="utf-8") as fh:
-            json.dump(state, fh, separators=(",", ":"), sort_keys=True)
+            json.dump(on_disk, fh, separators=(",", ":"), sort_keys=True)
             fh.flush()
             os.fsync(fh.fileno())
         os.chmod(tmp_path, FILE_MODE)
@@ -167,9 +182,11 @@ def save_session(mac: str, state: dict[str, Any]) -> None:
 def load_session(mac: str) -> dict[str, Any] | None:
     """Return the cached session dict, or ``None`` for absent/expired entries.
 
-    Honors python-kasa's monotonic ``_session_expire_at`` directly — a
-    stored value <= ``time.monotonic()`` reads as a miss (FR-CRED-6). Reads
-    do NOT take the per-device lock.
+    Reads the wall-clock expiry from disk and treats the entry as a miss when
+    the wall-clock has already passed. The returned dict carries a fresh
+    monotonic ``_session_expire_at`` value (computed from ``time.monotonic()``
+    plus the remaining wall-clock lifetime) so the wrapper layer can hand it
+    to ``KlapTransport`` unchanged. Reads do NOT take the per-device lock.
     """
     path = cache_path_for_mac(mac)
     if not path.exists():
@@ -195,6 +212,70 @@ def load_session(mac: str) -> dict[str, Any] | None:
             path.unlink()
         return None
 
+    return _from_disk_form(payload, path)
+
+
+def _to_disk_form(state: dict[str, Any]) -> dict[str, Any]:
+    """Translate an in-memory session dict to its on-disk form.
+
+    Removes the monotonic ``_session_expire_at`` key and replaces it with
+    a wall-clock ``_session_expire_at_wallclock`` (UNIX seconds float). A
+    non-numeric monotonic value is preserved as an already-expired wall-clock
+    sentinel (``0.0``) so the on-disk file deterministically reads as a miss
+    and round-trip semantics are maintained.
+    """
+    mono = state.pop(EXPIRE_KEY, None)
+    if mono is not None:
+        try:
+            mono_f = float(mono)
+        except (TypeError, ValueError):
+            # Already-expired sentinel — treat the cache entry as a miss on
+            # next read rather than silently dropping the (broken) expiry.
+            state[EXPIRE_KEY_WALLCLOCK] = 0.0
+        else:
+            wall = time.time() + (mono_f - time.monotonic())
+            state[EXPIRE_KEY_WALLCLOCK] = wall
+    return state
+
+
+def _from_disk_form(payload: dict[str, Any], path: Path) -> dict[str, Any] | None:
+    """Translate an on-disk session dict to its in-memory form.
+
+    Reads :data:`EXPIRE_KEY_WALLCLOCK`; if expired (wall <= ``time.time()``),
+    returns ``None``. Otherwise returns the payload with a freshly-computed
+    monotonic ``_session_expire_at`` so the wrapper sees the key it expects.
+
+    A payload that lacks both the wall-clock and the legacy monotonic key
+    is returned as-is (the wrapper-only test fixtures rely on this).
+    """
+    if EXPIRE_KEY_WALLCLOCK in payload:
+        wall_raw = payload.get(EXPIRE_KEY_WALLCLOCK)
+        try:
+            wall = float(wall_raw)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            logger.warning(
+                "auth_cache: %s has non-numeric %s=%r; treating as miss",
+                path,
+                EXPIRE_KEY_WALLCLOCK,
+                wall_raw,
+            )
+            return None
+        now_wall = time.time()
+        if wall <= now_wall:
+            logger.debug(
+                "auth_cache: %s expired wallclock=%.2f now=%.2f",
+                path,
+                wall,
+                now_wall,
+            )
+            return None
+        # Translate back to a fresh monotonic value the wrapper expects.
+        out = {k: v for k, v in payload.items() if k != EXPIRE_KEY_WALLCLOCK}
+        out[EXPIRE_KEY] = time.monotonic() + (wall - now_wall)
+        return out
+
+    # Legacy / no-expiry path: still honor a stored monotonic value if a
+    # caller writes one directly (some tests do). Same semantics as before.
     expire = payload.get(EXPIRE_KEY)
     if expire is not None:
         try:
@@ -209,7 +290,10 @@ def load_session(mac: str) -> dict[str, Any] | None:
             return None
         if expire_f <= time.monotonic():
             logger.debug(
-                "auth_cache: %s expired (%.2f <= now=%.2f)", path, expire_f, time.monotonic()
+                "auth_cache: %s expired (%.2f <= now=%.2f)",
+                path,
+                expire_f,
+                time.monotonic(),
             )
             return None
 
@@ -252,7 +336,10 @@ def list_sessions() -> list[SessionMetadata]:
     """Enumerate every cache file as :class:`SessionMetadata`.
 
     Files that fail to parse are silently skipped — ``auth status`` should
-    never crash on a corrupted cache entry.
+    never crash on a corrupted cache entry. The
+    :attr:`SessionMetadata.expires_at_monotonic` field is computed from the
+    on-disk wall-clock value so callers continue to see a monotonic-shaped
+    timestamp consistent with what :func:`load_session` returns.
     """
     base = cache_dir()
     out: list[SessionMetadata] = []
@@ -268,9 +355,21 @@ def list_sessions() -> list[SessionMetadata]:
         expire: float | None = None
         try:
             payload = json.loads(entry.read_text(encoding="utf-8"))
-            if isinstance(payload, dict) and EXPIRE_KEY in payload:
-                with contextlib.suppress(TypeError, ValueError):
-                    expire = float(payload[EXPIRE_KEY])
+            if isinstance(payload, dict):
+                if EXPIRE_KEY_WALLCLOCK in payload:
+                    with contextlib.suppress(TypeError, ValueError):
+                        wall = float(payload[EXPIRE_KEY_WALLCLOCK])
+                        # Translate wall-clock back to a monotonic-shaped
+                        # value: now_mono + (wall - now_wall) preserves the
+                        # original monotonic delta within process scheduling
+                        # jitter (microseconds — well under the 1ms test
+                        # tolerance).
+                        expire = time.monotonic() + (wall - time.time())
+                elif EXPIRE_KEY in payload:
+                    # Legacy on-disk monotonic value (test fixtures, or older
+                    # cache files written before the wall-clock migration).
+                    with contextlib.suppress(TypeError, ValueError):
+                        expire = float(payload[EXPIRE_KEY])
         except (OSError, json.JSONDecodeError) as exc:
             logger.debug("auth_cache: could not parse %s: %s", entry, exc)
         out.append(
@@ -408,6 +507,7 @@ __all__ = [
     "DIR_MODE",
     "ENV_CONFIG_DIR",
     "EXPIRE_KEY",
+    "EXPIRE_KEY_WALLCLOCK",
     "FILE_MODE",
     "TOKENS_SUBDIR",
     "SessionMetadata",

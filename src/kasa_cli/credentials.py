@@ -216,7 +216,19 @@ def _coerce_version(payload: dict[str, Any], path: Path) -> int:
 
 
 def _enforce_permissions(path: Path) -> None:
-    """Reject any group/world-readable or -writable bits (FR-CRED-2)."""
+    """Reject permissive modes — and refuse symlinks outright (FR-CRED-2 / R5).
+
+    A symlink to a 0600-mode target file would otherwise pass: ``path.stat()``
+    follows the link and reads the target's mode. By refusing symlinks before
+    any stat call, we ensure the actual file an operator sees in
+    ``ls -l <path>`` is the one we audited.
+    """
+    if path.is_symlink():
+        raise AuthError(
+            f"credentials file {path} is a symlink; refusing for safety",
+            hint="Replace the symlink with the actual file or use a per-device override.",
+            extra={"path": str(path)},
+        )
     info = path.stat()
     mode = stat.S_IMODE(info.st_mode)
     if mode & 0o077:
