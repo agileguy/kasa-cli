@@ -11,7 +11,7 @@ import contextlib
 from collections.abc import Callable
 
 from kasa_cli import wrapper
-from kasa_cli.errors import EXIT_OK, DeviceError
+from kasa_cli.errors import EXIT_SUCCESS, DeviceError
 from kasa_cli.output import OutputMode, device_to_text, emit
 from kasa_cli.wrapper import CredentialBundle
 
@@ -48,4 +48,4 @@ async def run_info(
             await kdev.disconnect()
 
     emit(record, mode, formatter=lambda d: device_to_text(d))  # type: ignore[arg-type]
-    return EXIT_OK
+    return EXIT_SUCCESS

@@ -25,7 +25,7 @@ import asyncio
 import datetime as dt
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import kasa
 from kasa.exceptions import (
@@ -40,7 +40,7 @@ from kasa_cli.errors import (
     DeviceError,
     NetworkError,
     NotFoundError,
-    UnsupportedError,
+    UnsupportedFeatureError,
 )
 from kasa_cli.types import Device, Socket
 
@@ -64,7 +64,7 @@ def _normalize_mac(value: str | None) -> str:
     return cleaned
 
 
-def _detect_protocol(device: kasa.Device) -> str:
+def _detect_protocol(device: kasa.Device) -> Literal["legacy", "klap"]:
     """Best-effort heuristic for ``protocol`` field in the Device record.
 
     python-kasa 0.10.2 exposes the encryption type via the active
@@ -106,7 +106,7 @@ def _sockets_of(device: kasa.Device) -> list[Socket] | None:
     return sockets
 
 
-def _state_of(device: kasa.Device) -> str:
+def _state_of(device: kasa.Device) -> Literal["on", "off", "mixed"]:
     """Return ``"on"``, ``"off"``, or ``"mixed"`` for the device or strip."""
     children = getattr(device, "children", None)
     if children:
@@ -227,7 +227,7 @@ async def resolve_target(
             target=target,
         ) from exc
     except UnsupportedDeviceError as exc:
-        raise UnsupportedError(
+        raise UnsupportedFeatureError(
             f"Device {target!r} reports as unsupported: {exc}",
             target=target,
         ) from exc

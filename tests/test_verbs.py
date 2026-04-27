@@ -9,12 +9,12 @@ from typing import Any
 import pytest
 
 from kasa_cli.errors import (
-    EXIT_OK,
+    EXIT_SUCCESS,
     AuthError,
     DeviceError,
     NetworkError,
     NotFoundError,
-    UnsupportedError,
+    UnsupportedFeatureError,
     UsageError,
 )
 from kasa_cli.output import OutputMode
@@ -47,7 +47,7 @@ async def test_discover_emits_devices_jsonl(
         credentials=CredentialBundle(),
         mode=OutputMode.JSONL,
     )
-    assert code == EXIT_OK
+    assert code == EXIT_SUCCESS
     captured = capsys.readouterr()
     line = captured.out.strip()
     assert line  # non-empty
@@ -70,7 +70,7 @@ async def test_discover_zero_devices_exits_zero_with_info(
         credentials=CredentialBundle(),
         mode=OutputMode.JSONL,
     )
-    assert code == EXIT_OK
+    assert code == EXIT_SUCCESS
     err = capsys.readouterr()
     assert "0 devices found" in err.err
 
@@ -112,7 +112,7 @@ async def test_list_no_probe_emits_null_online(
         concurrency=2,
         mode=OutputMode.JSONL,
     )
-    assert code == EXIT_OK
+    assert code == EXIT_SUCCESS
     out = capsys.readouterr().out
     lines = [json.loads(line) for line in out.strip().splitlines()]
     assert len(lines) == 2
@@ -143,7 +143,7 @@ async def test_list_probe_invokes_per_device_check(
         concurrency=2,
         mode=OutputMode.JSONL,
     )
-    assert code == EXIT_OK
+    assert code == EXIT_SUCCESS
     parsed = json.loads(capsys.readouterr().out.strip())
     assert parsed["online"] is True
 
@@ -171,7 +171,7 @@ async def test_list_online_only_filters_offline(
         concurrency=2,
         mode=OutputMode.JSONL,
     )
-    assert code == EXIT_OK
+    assert code == EXIT_SUCCESS
     assert capsys.readouterr().out.strip() == ""
 
 
@@ -197,7 +197,7 @@ async def test_info_happy_path(
         timeout=1.0,
         mode=OutputMode.JSONL,
     )
-    assert code == EXIT_OK
+    assert code == EXIT_SUCCESS
     parsed = json.loads(capsys.readouterr().out.strip())
     assert parsed["alias"] == "kitchen-lamp"
     assert parsed["state"] == "on"
@@ -265,7 +265,7 @@ async def test_on_idempotent_already_on(
         timeout=1.0,
         mode=OutputMode.JSONL,
     )
-    assert code == EXIT_OK
+    assert code == EXIT_SUCCESS
     assert dev.turn_on_called == 0  # idempotent: never called
 
 
@@ -291,7 +291,7 @@ async def test_off_flips_state(
         timeout=1.0,
         mode=OutputMode.JSONL,
     )
-    assert code == EXIT_OK
+    assert code == EXIT_SUCCESS
     assert dev.turn_off_called == 1
 
 
@@ -345,7 +345,7 @@ async def test_multi_socket_strip_socket_all(
         timeout=1.0,
         mode=OutputMode.JSONL,
     )
-    assert code == EXIT_OK
+    assert code == EXIT_SUCCESS
     # Two sockets were off; both should have been turned on. The third was
     # already on (idempotent).
     on_calls = sum(child.turn_on_called for child in hs300_strip.children)
@@ -372,7 +372,7 @@ async def test_multi_socket_strip_specific_socket(
         timeout=1.0,
         mode=OutputMode.JSONL,
     )
-    assert code == EXIT_OK
+    assert code == EXIT_SUCCESS
     assert hs300_strip.children[1].turn_on_called == 1
     assert hs300_strip.children[0].turn_on_called == 0
 
@@ -499,7 +499,7 @@ async def test_unsupported_device_propagates(
 
     monkeypatch.setattr("kasa.Device.connect", _fake_connect)
 
-    with pytest.raises(UnsupportedError):
+    with pytest.raises(UnsupportedFeatureError):
         await run_onoff(
             action="on",
             target="kitchen-lamp",

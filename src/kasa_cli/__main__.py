@@ -13,7 +13,7 @@ from __future__ import annotations
 import click
 
 from kasa_cli.cli import main as _cli_main
-from kasa_cli.errors import EXIT_USAGE, StructuredError
+from kasa_cli.errors import EXIT_USAGE_ERROR, StructuredError
 from kasa_cli.output import OutputMode, emit_error
 
 
@@ -38,13 +38,13 @@ def main() -> int:
         # SRD-shaped structured error on stderr.
         err = StructuredError(
             error="usage_error",
-            exit_code=EXIT_USAGE,
+            exit_code=EXIT_USAGE_ERROR,
             target=None,
             message=str(exc),
             hint="Run with --help for usage.",
         )
         emit_error(err, OutputMode.JSONL)
-        return EXIT_USAGE
+        return EXIT_USAGE_ERROR
     except click.ClickException as exc:
         exc.show()
         return exc.exit_code

@@ -33,10 +33,10 @@ from typing import Any
 import click
 
 from kasa_cli.errors import (
-    EXIT_OK,
+    EXIT_SUCCESS,
     EXIT_SIGINT,
     EXIT_SIGTERM,
-    EXIT_USAGE,
+    EXIT_USAGE_ERROR,
     ConfigError,
     KasaCliError,
     StructuredError,
@@ -76,7 +76,7 @@ def _err_name(exc: KasaCliError) -> str:
             DeviceError,
             NetworkError,
             NotFoundError,
-            UnsupportedError,
+            UnsupportedFeatureError,
         )
         from kasa_cli.errors import (
             ConfigError as ConfigErr,
@@ -92,7 +92,7 @@ def _err_name(exc: KasaCliError) -> str:
                 DeviceError: "device_error",
                 NetworkError: "network_error",
                 NotFoundError: "not_found",
-                UnsupportedError: "unsupported_feature",
+                UnsupportedFeatureError: "unsupported_feature",
                 UsageErr: "usage_error",
             }
         )
@@ -171,24 +171,53 @@ def _run_async(
 # --- Config / credentials helpers (lazy A integration) ------------------------
 
 
-def _resolve_credentials(source: str | None) -> CredentialBundle:
-    """Resolve a CredentialBundle using Engineer A's resolver if present.
+def _resolve_credentials(
+    source: str | None,
+    config: Any | None = None,
+    alias: str | None = None,
+) -> CredentialBundle:
+    """Resolve a CredentialBundle using Engineer A's resolver.
 
-    ``source`` is the value from ``--credential-source`` (env / file / none).
-    When Engineer A's module is not yet merged, we honor only ``env`` and
-    ``none`` so the CLI remains usable for the legacy-protocol path.
+    ``source`` is the value from ``--credential-source``:
+    - ``none``: skip resolution; KLAP devices will fail with auth-required errors.
+    - ``env``: only honor ``KASA_USERNAME`` / ``KASA_PASSWORD``.
+    - ``file`` or ``None``: walk the full per-target → env → file chain.
+
+    ``config`` is required when ``source`` is anything other than ``none`` or
+    ``env`` so A's resolver can find the default credentials file path.
     """
     if source == "none":
         return CredentialBundle()
+
+    if source == "env":
+        # Strict env-only path: do not consult the file resolver.
+        import os
+
+        return CredentialBundle(
+            username=os.environ.get("KASA_USERNAME"),
+            password=os.environ.get("KASA_PASSWORD"),
+        )
+
     creds_mod = _import_optional("credentials")
     if creds_mod is not None and hasattr(creds_mod, "resolve_credentials"):
+        if config is None:
+            cfg_mod = _import_optional("config")
+            if cfg_mod is not None and hasattr(cfg_mod, "load_config"):
+                try:
+                    config = cfg_mod.load_config(None)
+                except Exception as exc:
+                    raise ConfigError(
+                        f"Credential resolution failed: cannot load config: {exc}",
+                    ) from exc
         try:
-            resolved = creds_mod.resolve_credentials(source=source)
+            resolved = creds_mod.resolve_credentials(config, alias=alias)
         except Exception as exc:
             raise ConfigError(
                 f"Credential resolution failed: {exc}",
                 hint="Check ~/.config/kasa-cli/credentials and KASA_USERNAME/KASA_PASSWORD.",
             ) from exc
+        if resolved is None:
+            return CredentialBundle()
         if isinstance(resolved, CredentialBundle):
             return resolved
         if isinstance(resolved, dict):
@@ -205,7 +234,7 @@ def _resolve_credentials(source: str | None) -> CredentialBundle:
             "credentials.resolve_credentials returned an unexpected shape",
         )
 
-    # Fallback: env vars only.
+    # Final fallback when A's modules aren't available at all (degraded mode).
     import os
 
     return CredentialBundle(
@@ -319,7 +348,7 @@ def main(
     if json_flag and jsonl_flag:
         # FR-33 / FR-34 are mutually exclusive in spirit. Fail fast.
         click.echo("error: --json and --jsonl are mutually exclusive", err=True)
-        ctx.exit(EXIT_USAGE)
+        ctx.exit(EXIT_USAGE_ERROR)
     mode = detect_mode(json_flag=json_flag, jsonl_flag=jsonl_flag, quiet=quiet)
     ctx.obj = {
         "mode": mode,
@@ -400,7 +429,7 @@ def list_cmd(
             return f"{g.get('name', '')}: " + ", ".join(members)
 
         _emit_stream(items, state["mode"], formatter=_fmt_group)
-        sys.exit(EXIT_OK)
+        sys.exit(EXIT_SUCCESS)
 
     devices = _devices_section(cfg)
 
@@ -506,7 +535,7 @@ def _require_engineer_a_attr(
     if fn is None:
         err = StructuredError(
             error="unsupported_feature",
-            exit_code=EXIT_USAGE,
+            exit_code=EXIT_USAGE_ERROR,
             target=None,
             message=(
                 f"{sub_verb} is not yet wired up — Engineer A's "
@@ -515,7 +544,7 @@ def _require_engineer_a_attr(
             hint="Re-run after the Phase 1 merge.",
         )
         emit_error(err, state["mode"])
-        sys.exit(EXIT_USAGE)
+        sys.exit(EXIT_USAGE_ERROR)
     return fn
 
 
@@ -538,7 +567,7 @@ def config_show(ctx: click.Context) -> None:
         sub_verb="config show",
     )
     click.echo(fn(ctx.obj["config_path"]))
-    sys.exit(EXIT_OK)
+    sys.exit(EXIT_SUCCESS)
 
 
 @config_group.command("validate")
@@ -555,7 +584,7 @@ def config_validate(ctx: click.Context, *, path: str | None) -> None:
     state = ctx.obj
     try:
         fn(path or state["config_path"])
-        sys.exit(EXIT_OK)
+        sys.exit(EXIT_SUCCESS)
     except KasaCliError as exc:
         emit_error(_to_structured(exc), state["mode"])
         sys.exit(exc.exit_code)
@@ -582,7 +611,7 @@ def auth_status(ctx: click.Context) -> None:
     from kasa_cli.output import emit_stream
 
     emit_stream(list(fn()), ctx.obj["mode"], formatter=str)
-    sys.exit(EXIT_OK)
+    sys.exit(EXIT_SUCCESS)
 
 
 @auth_group.command("flush")
@@ -598,7 +627,7 @@ def auth_flush(ctx: click.Context, *, target: str | None) -> None:
     )
     deleted = fn(target=target)
     click.echo(f"flushed {deleted} session file(s)")
-    sys.exit(EXIT_OK)
+    sys.exit(EXIT_SUCCESS)
 
 
 __all__ = ["UsageError", "main"]

@@ -17,7 +17,7 @@ from typing import Any
 import kasa
 
 from kasa_cli import wrapper
-from kasa_cli.errors import EXIT_OK
+from kasa_cli.errors import EXIT_SUCCESS
 from kasa_cli.output import OutputMode, emit_stream, list_view_to_text
 from kasa_cli.wrapper import CredentialBundle
 
@@ -116,4 +116,4 @@ async def run_list(
         views = [v for v in views if v["online"]]
 
     emit_stream(views, mode, formatter=lambda v: list_view_to_text(v))  # type: ignore[arg-type]
-    return EXIT_OK
+    return EXIT_SUCCESS

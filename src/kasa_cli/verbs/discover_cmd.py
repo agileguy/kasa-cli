@@ -11,7 +11,7 @@ from __future__ import annotations
 import sys
 
 from kasa_cli import wrapper
-from kasa_cli.errors import EXIT_OK
+from kasa_cli.errors import EXIT_SUCCESS
 from kasa_cli.output import OutputMode, device_to_text, emit_stream
 from kasa_cli.wrapper import CredentialBundle
 
@@ -40,4 +40,4 @@ async def run_discover(
         sys.stderr.write(f"INFO timeout reached, 0 devices found (timeout={timeout:g}s)\n")
 
     emit_stream(devices, mode, formatter=lambda d: device_to_text(d))  # type: ignore[arg-type]
-    return EXIT_OK
+    return EXIT_SUCCESS

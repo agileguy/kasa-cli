@@ -12,7 +12,7 @@ from kasa_cli.errors import (
     AuthError,
     NetworkError,
     NotFoundError,
-    UnsupportedError,
+    UnsupportedFeatureError,
 )
 from kasa_cli.types import Device
 from kasa_cli.wrapper import CredentialBundle
@@ -91,7 +91,7 @@ async def test_resolve_target_translates_kasa_errors(
     cases: list[tuple[type[BaseException], type[BaseException]]] = [
         (AuthenticationError, AuthError),
         (KasaTimeoutError, NetworkError),
-        (UnsupportedDeviceError, UnsupportedError),
+        (UnsupportedDeviceError, UnsupportedFeatureError),
         (KasaException, type(NetworkError("x"))),  # Generic -> DeviceError; lenient
     ]
     for raised, _expected_family in cases:
@@ -115,7 +115,7 @@ async def test_resolve_target_translates_kasa_errors(
         assert info.value.__class__.__name__ in {
             "AuthError",
             "NetworkError",
-            "UnsupportedError",
+            "UnsupportedFeatureError",
             "DeviceError",
         }
 

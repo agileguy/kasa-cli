@@ -20,7 +20,7 @@ from typing import Literal
 import kasa
 
 from kasa_cli import wrapper
-from kasa_cli.errors import EXIT_OK, DeviceError, UnsupportedError, UsageError
+from kasa_cli.errors import EXIT_SUCCESS, DeviceError, UnsupportedFeatureError, UsageError
 from kasa_cli.output import OutputMode
 from kasa_cli.wrapper import CredentialBundle
 
@@ -121,7 +121,7 @@ async def run_onoff(
             if socket_arg.lower() == "all":
                 for child in children:
                     await _toggle_one(child, action)
-                return EXIT_OK
+                return EXIT_SUCCESS
 
             try:
                 index = int(socket_arg)
@@ -140,14 +140,14 @@ async def run_onoff(
                     target=target,
                 )
             await _toggle_one(children[index - 1], action)
-            return EXIT_OK
+            return EXIT_SUCCESS
 
         # Single-socket device. Allow only ``--socket 1`` or omitted.
         if socket_arg is not None:
             if socket_arg.lower() == "all":
                 # Treat as a no-op specifier on a single-socket device.
                 await _toggle_one(kdev, action)
-                return EXIT_OK
+                return EXIT_SUCCESS
             try:
                 idx = int(socket_arg)
             except ValueError as exc:
@@ -166,7 +166,7 @@ async def run_onoff(
         # outlet.
         children = list(getattr(kdev, "children", []) or [])
         if children and not multi:
-            raise UnsupportedError(
+            raise UnsupportedFeatureError(
                 (
                     f"Target {target!r} reports child sockets but model "
                     f"{model!r} is not in the recognized multi-socket set. "
@@ -176,7 +176,7 @@ async def run_onoff(
             )
 
         await _toggle_one(kdev, action)
-        return EXIT_OK
+        return EXIT_SUCCESS
     finally:
         with contextlib.suppress(Exception):
             await kdev.disconnect()
