@@ -389,6 +389,16 @@ def _devices_section(cfg: Config | None) -> list[dict[str, Any]]:
     type=click.Choice(["env", "file", "none"]),
     default=None,
 )
+@click.option(
+    "--concurrency",
+    "concurrency_override",
+    type=int,
+    default=None,
+    help=(
+        "Override [defaults] concurrency for this invocation (FR-28). "
+        "Applies to @group fanout and (Phase 3 Engineer B3) batch."
+    ),
+)
 @click.option("-v", "verbose", count=True, help="-v / -vv stderr verbosity.")
 @click.pass_context
 def main(
@@ -400,6 +410,7 @@ def main(
     timeout: float,
     config_path: str | None,
     credential_source: str | None,
+    concurrency_override: int | None,
     verbose: int,
 ) -> None:
     """``kasa-cli`` — deterministic local-LAN CLI for TP-Link Kasa devices."""
@@ -420,6 +431,7 @@ def main(
         "timeout": timeout,
         "config_path": config_path,
         "credential_source": credential_source,
+        "concurrency_override": concurrency_override,
         "verbose": verbose,
     }
 
@@ -988,3 +1000,741 @@ def schedule_list_cmd(ctx: click.Context, *, target: str) -> None:
 
 
 __all__ = ["UsageError", "main"]
+
+
+# --- Phase 3 Engineer A: groups + @group target + --concurrency ---------------
+#
+# This block adds:
+#
+#   * the ``groups list`` sub-verb (FR-26..29b),
+#   * resolution of ``@group-name`` and ``--group <name>`` targets across the
+#     existing per-target verbs (info, on, off, toggle, set, energy,
+#     schedule list),
+#   * a global ``--concurrency`` flag that overrides ``[defaults] concurrency``
+#     for the invocation (FR-28).
+#
+# It is intentionally appended in a single delimited section so the merge with
+# Engineer B3's batch verb (which consumes the same ``parallel.run_parallel``
+# engine) is mechanical. The CHANGES TO EXISTING VERBS in this block are
+# additive: each per-target verb that previously called ``_run_async(run_X(
+# target=..., ...))`` is rewritten to call ``_dispatch_target_or_group``
+# instead, which decides single-target vs @group fanout. The single-target
+# behavior is unchanged.
+#
+# Design choices documented at the top of ``parallel.py``:
+#   * ``on_each: Callable[[TaskResult], None]`` (sync) over an async
+#     ``iter_results`` generator — keeps emit_one's flush semantics intact
+#     and matches the sync ``on_signal`` hook.
+#   * ``--socket`` + ``@group`` is REJECTED with exit 64. Different strips in
+#     a group have different socket counts and applying the same socket index
+#     to every fanout member is operationally surprising. Operators who want
+#     per-socket fanout should write a small loop.
+#   * ``auth flush @group`` is NOT supported. ``auth flush --target <alias>``
+#     stays single-target; group flushes are a small ``for`` loop in the
+#     operator's shell.
+
+import io as _io  # noqa: E402
+
+from kasa_cli import parallel as _parallel  # noqa: E402
+from kasa_cli.errors import (  # noqa: E402
+    EXIT_DEVICE_ERROR,
+    EXIT_PARTIAL_FAILURE,
+)
+from kasa_cli.output import emit_one as _emit_one  # noqa: E402
+from kasa_cli.output import emit_stream as _emit_stream  # noqa: E402
+from kasa_cli.parallel import TaskResult as _TaskResult  # noqa: E402
+from kasa_cli.verbs.groups_cmd import (  # noqa: E402
+    _group_to_text,
+    collect_groups,
+    run_groups_list,
+)
+
+
+def _is_group_target(target: str) -> bool:
+    """Return True if ``target`` is the ``@group-name`` syntax (FR-27)."""
+    return isinstance(target, str) and target.startswith("@") and len(target) > 1
+
+
+def _resolve_group_members(target: str, cfg: Config) -> list[str]:
+    """Resolve ``@group-name`` to its member alias list.
+
+    Raises :class:`UsageError` (exit 64) when the group isn't defined. Empty
+    groups are legal and return ``[]`` — the fanout layer handles that as a
+    no-op exit-0 (matches FR-31b's empty-batch contract).
+    """
+    name = target[1:]  # strip the leading '@'
+    if not name:
+        raise UsageError(
+            "Empty group target: '@' with no group name",
+            target=target,
+            hint="Use '@<group-name>' (e.g. '@bedroom-lights').",
+        )
+    if name not in cfg.groups:
+        configured = sorted(cfg.groups.keys())
+        configured_repr = ", ".join(configured) if configured else "<none>"
+        raise UsageError(
+            f"Unknown group: {name!r}",
+            target=target,
+            hint=f"Defined groups: {configured_repr}. Define [groups] in your config.toml.",
+        )
+    return list(cfg.groups[name])
+
+
+def _resolve_concurrency(state: dict[str, Any], cfg: Config) -> int:
+    """Pick the effective concurrency cap.
+
+    Resolution order (highest priority first):
+        1. ``--concurrency N`` CLI flag (state['concurrency_override']),
+        2. ``[defaults] concurrency`` from the loaded config,
+        3. Built-in default (``DEFAULT_CONCURRENCY = 10``) — already baked
+           into the Config dataclass.
+    """
+    override = state.get("concurrency_override")
+    if override is not None and override > 0:
+        return int(override)
+    return int(cfg.defaults.concurrency)
+
+
+def _task_result_to_text(result: object) -> str:
+    """Render a :class:`TaskResult` as one human-readable line for TEXT mode."""
+    if not isinstance(result, _TaskResult):
+        return str(result)
+    if result.success:
+        return f"{result.target}: ok"
+    err_msg = result.error.message if result.error is not None else "failed"
+    return f"{result.target}: FAIL ({result.error.error if result.error else 'error'}) {err_msg}"
+
+
+def _task_result_to_dict(result: _TaskResult) -> dict[str, Any]:
+    """Project a :class:`TaskResult` into a JSON-emittable dict.
+
+    Schema:
+        {"target": str, "success": bool, "exit_code": int,
+         "error": {<§11.2 envelope>}?}
+    """
+    payload: dict[str, Any] = {
+        "target": result.target,
+        "success": result.success,
+        "exit_code": result.exit_code,
+    }
+    if result.error is not None:
+        payload["error"] = result.error.to_dict()
+    return payload
+
+
+async def _wrap_single_run(
+    target: str,
+    run_single: Callable[[str], Coroutine[Any, Any, int]],
+) -> _TaskResult:
+    """Adapt a verb's ``run_X(target)`` into a :class:`TaskResult`.
+
+    The verb's run-async returns ``int`` on success and raises a
+    :class:`KasaCliError` on per-target failure. We catch the error, pull its
+    structured shape, and return a ``success=False`` :class:`TaskResult`.
+    Anything else that escapes is wrapped into a generic ``device_error``
+    envelope so the aggregate stays well-formed.
+    """
+    try:
+        code = await run_single(target)
+    except KasaCliError as exc:
+        return _TaskResult(
+            target=target,
+            success=False,
+            exit_code=exc.exit_code,
+            error=_to_structured(exc),
+        )
+    except Exception as exc:  # truly unexpected — keep aggregate well-formed
+        err = StructuredError(
+            error="device_error",
+            exit_code=EXIT_DEVICE_ERROR,
+            target=target,
+            message=f"unhandled error: {type(exc).__name__}: {exc}",
+        )
+        return _TaskResult(
+            target=target,
+            success=False,
+            exit_code=EXIT_DEVICE_ERROR,
+            error=err,
+        )
+    return _TaskResult(
+        target=target,
+        success=code == EXIT_SUCCESS,
+        exit_code=int(code),
+        output=None,
+    )
+
+
+def _dispatch_target_or_group(
+    *,
+    state: dict[str, Any],
+    cfg: Config,
+    target: str,
+    run_single: Callable[[str, OutputMode], Coroutine[Any, Any, int]],
+    rejects_group: tuple[str, ...] = (),
+) -> int:
+    """Dispatch a per-target verb as either single-target or @group fanout.
+
+    Args:
+        state: ``ctx.obj`` dict from the Click parent group.
+        cfg: Loaded :class:`Config`.
+        target: Raw target string from the operator (alias / IP / MAC /
+            ``@group``).
+        run_single: Coroutine factory ``run_single(target, mode) -> int``
+            implementing the single-target verb. The fanout layer calls this
+            once per group member, with ``mode=QUIET`` so only the aggregate
+            ``TaskResult`` stream reaches stdout.
+        rejects_group: Iterable of human-readable flag names that are
+            incompatible with @group fanout (e.g. ``("--socket",)``). When
+            non-empty AND the target is a group, raises :class:`UsageError`.
+
+    Returns:
+        The exit code Click should propagate. For single-target this is the
+        verb's own exit; for fanout this is the aggregate.exit_code.
+    """
+    mode = state["mode"]
+
+    if not _is_group_target(target):
+        # Single-target path — original behavior preserved exactly.
+        return _run_async(lambda: run_single(target, mode), mode=mode)
+
+    # @group fanout path.
+    if rejects_group:
+        raise UsageError(
+            (
+                f"Flags {', '.join(rejects_group)} cannot be combined with "
+                f"a @group target ({target!r}); group members may have "
+                "different shapes (multi-socket vs single, etc). Use a "
+                "shell loop over individual aliases instead."
+            ),
+            target=target,
+            hint=(
+                "Example: for a in $(kasa-cli --json groups list | jq ...); "
+                "do kasa-cli ... $a; done"
+            ),
+        )
+
+    members = _resolve_group_members(target, cfg)
+    concurrency = _resolve_concurrency(state, cfg)
+
+    async def _runner() -> int:
+        async def _per_target(member: str) -> _TaskResult:
+            return await _wrap_single_run(
+                member,
+                # Each group member executes with QUIET so only the
+                # TaskResult stream reaches stdout. This is the SRD §11.2 /
+                # FR-35a contract: each fanout member emits one JSONL line
+                # (success or failure object).
+                lambda m: run_single(m, OutputMode.QUIET),
+            )
+
+        # JSONL/TEXT — stream each TaskResult per-member to stdout. JSON —
+        # buffer into one top-level array and emit once at the end so the
+        # document is syntactically a JSON array.
+        if mode is OutputMode.JSONL or mode is OutputMode.TEXT:
+
+            def _on_each(r: _TaskResult) -> None:
+                _emit_one(
+                    _task_result_to_dict(r) if mode is OutputMode.JSONL else r,
+                    mode,
+                    formatter=_task_result_to_text,
+                )
+
+            agg = await _parallel.run_parallel(
+                members,
+                _per_target,
+                concurrency=concurrency,
+                on_each=_on_each,
+            )
+            return agg.exit_code
+
+        if mode is OutputMode.JSON:
+            agg = await _parallel.run_parallel(
+                members,
+                _per_target,
+                concurrency=concurrency,
+                on_each=None,
+            )
+            _emit_stream(
+                [_task_result_to_dict(r) for r in agg.results],
+                mode,
+                formatter=_task_result_to_text,
+            )
+            return agg.exit_code
+
+        # QUIET — just compute the aggregate; nothing to stdout.
+        agg = await _parallel.run_parallel(
+            members,
+            _per_target,
+            concurrency=concurrency,
+            on_each=None,
+        )
+        return agg.exit_code
+
+    return _run_async(_runner, mode=mode)
+
+
+# --- groups list --------------------------------------------------------------
+
+
+@main.group("groups", invoke_without_command=False)
+def groups_group() -> None:
+    """List local group definitions (read-only).
+
+    v1 only exposes ``groups list``. ``add`` / ``remove`` are NOT in scope per
+    SRD FR-29b — group mutation is by hand-editing ``~/.config/kasa-cli/
+    config.toml``. Comment-preserving TOML round-trip is non-trivial and the
+    CLI deliberately never writes user config files.
+    """
+
+
+@groups_group.command("list")
+@click.pass_context
+def groups_list_cmd(ctx: click.Context) -> None:
+    """Print every group from config with its member aliases."""
+    state = ctx.obj
+    try:
+        cfg = _load_config(state["config_path"])
+    except KasaCliError as exc:
+        emit_error(_to_structured(exc), state["mode"])
+        sys.exit(exc.exit_code)
+
+    code = _run_async(
+        lambda: run_groups_list(config=cfg, mode=state["mode"]),
+        mode=state["mode"],
+    )
+    sys.exit(code)
+
+
+# --- Per-verb fanout-aware re-dispatchers ------------------------------------
+#
+# These replace the original Click callbacks for the per-target verbs that
+# accept an alias / IP / MAC / @group. The single-target code paths inside
+# each verb's ``run_X(...)`` are unchanged — we just decide where to land
+# (single vs fanout) at the dispatcher.
+
+
+def _build_run_info_single(
+    cfg: Config, state: dict[str, Any]
+) -> Callable[[str, OutputMode], Coroutine[Any, Any, int]]:
+    def creds_factory(alias: str) -> CredentialBundle:
+        return _resolve_credentials(state["credential_source"], config=cfg, alias=alias)
+
+    async def _run(target: str, mode: OutputMode) -> int:
+        from kasa_cli.verbs.info_cmd import run_info
+
+        return await run_info(
+            target=target,
+            config_lookup=_make_config_lookup(cfg),
+            credentials=creds_factory(target),
+            timeout=state["timeout"],
+            mode=mode,
+        )
+
+    return _run
+
+
+def _build_run_onoff_single(
+    action: str, cfg: Config, state: dict[str, Any], socket_arg: str | None
+) -> Callable[[str, OutputMode], Coroutine[Any, Any, int]]:
+    def creds_factory(alias: str) -> CredentialBundle:
+        return _resolve_credentials(state["credential_source"], config=cfg, alias=alias)
+
+    async def _run(target: str, mode: OutputMode) -> int:
+        from kasa_cli.verbs.onoff import run_onoff
+
+        return await run_onoff(
+            action=action,  # type: ignore[arg-type]
+            target=target,
+            socket_arg=socket_arg,
+            config_lookup=_make_config_lookup(cfg),
+            credentials=creds_factory(target),
+            timeout=state["timeout"],
+            mode=mode,
+        )
+
+    return _run
+
+
+def _build_run_toggle_single(
+    cfg: Config, state: dict[str, Any], socket_arg: str | None
+) -> Callable[[str, OutputMode], Coroutine[Any, Any, int]]:
+    def creds_factory(alias: str) -> CredentialBundle:
+        return _resolve_credentials(state["credential_source"], config=cfg, alias=alias)
+
+    async def _run(target: str, mode: OutputMode) -> int:
+        from kasa_cli.verbs.toggle_cmd import run_toggle
+
+        return await run_toggle(
+            target=target,
+            socket_arg=socket_arg,
+            config_lookup=_make_config_lookup(cfg),
+            credentials=creds_factory(target),
+            timeout=state["timeout"],
+            mode=mode,
+        )
+
+    return _run
+
+
+def _build_run_set_single(
+    cfg: Config,
+    state: dict[str, Any],
+    *,
+    brightness: int | None,
+    color_temp: int | None,
+    hsv: str | None,
+    hex_color: str | None,
+    color_name: str | None,
+    socket_arg: str | None,
+) -> Callable[[str, OutputMode], Coroutine[Any, Any, int]]:
+    def creds_factory(alias: str) -> CredentialBundle:
+        return _resolve_credentials(state["credential_source"], config=cfg, alias=alias)
+
+    async def _run(target: str, mode: OutputMode) -> int:
+        from kasa_cli.verbs.set_cmd import run_set
+
+        return await run_set(
+            target=target,
+            brightness=brightness,
+            color_temp=color_temp,
+            hsv=hsv,
+            hex_color=hex_color,
+            color_name=color_name,
+            socket_arg=socket_arg,
+            config_lookup=_make_config_lookup(cfg),
+            credentials=creds_factory(target),
+            timeout=state["timeout"],
+            mode=mode,
+        )
+
+    return _run
+
+
+def _build_run_energy_single(
+    cfg: Config,
+    state: dict[str, Any],
+    *,
+    watch_seconds: float | None,
+    cumulative: bool,
+    socket: int | None,
+) -> Callable[[str, OutputMode], Coroutine[Any, Any, int]]:
+    def creds_factory(alias: str) -> CredentialBundle:
+        return _resolve_credentials(state["credential_source"], config=cfg, alias=alias)
+
+    async def _run(target: str, mode: OutputMode) -> int:
+        from kasa_cli.verbs.energy_cmd import run_energy
+
+        return await run_energy(
+            target=target,
+            watch_seconds=watch_seconds,
+            cumulative=cumulative,
+            socket=socket,
+            config_lookup=_make_config_lookup(cfg),
+            credentials=creds_factory(target),
+            timeout=state["timeout"],
+            mode=mode,
+        )
+
+    return _run
+
+
+def _build_run_schedule_single(
+    cfg: Config, state: dict[str, Any]
+) -> Callable[[str, OutputMode], Coroutine[Any, Any, int]]:
+    def creds_factory(alias: str) -> CredentialBundle:
+        return _resolve_credentials(state["credential_source"], config=cfg, alias=alias)
+
+    async def _run(target: str, mode: OutputMode) -> int:
+        from kasa_cli.verbs.schedule_cmd import run_schedule_list
+
+        return await run_schedule_list(
+            target=target,
+            config_lookup=_make_config_lookup(cfg),
+            credentials=creds_factory(target),
+            timeout=state["timeout"],
+            mode=mode,
+        )
+
+    return _run
+
+
+# --- Override existing per-target verb registrations with fanout-aware wrappers
+
+
+def _override_info_handler() -> None:
+    """Replace ``info`` with a fanout-aware dispatcher (alias / IP / @group)."""
+
+    @click.argument("target", type=str)
+    @click.pass_context
+    def _impl(ctx: click.Context, *, target: str) -> None:
+        state = ctx.obj
+        cfg = _load_config(state["config_path"])
+        run_single = _build_run_info_single(cfg, state)
+        try:
+            code = _dispatch_target_or_group(
+                state=state, cfg=cfg, target=target, run_single=run_single
+            )
+        except KasaCliError as exc:
+            emit_error(_to_structured(exc), state["mode"])
+            sys.exit(exc.exit_code)
+        sys.exit(code)
+
+    main.commands["info"] = main.command("info", help="Show full live state of one target.")(_impl)
+
+
+def _override_onoff_handlers() -> None:
+    """Replace ``on`` and ``off`` with fanout-aware dispatchers."""
+
+    def _make(action: str) -> Callable[..., None]:
+        @click.argument("target", type=str)
+        @click.option("--socket", "socket_arg", type=str, default=None)
+        @click.pass_context
+        def _impl(ctx: click.Context, *, target: str, socket_arg: str | None) -> None:
+            state = ctx.obj
+            cfg = _load_config(state["config_path"])
+            run_single = _build_run_onoff_single(action, cfg, state, socket_arg)
+            try:
+                code = _dispatch_target_or_group(
+                    state=state,
+                    cfg=cfg,
+                    target=target,
+                    run_single=run_single,
+                    rejects_group=("--socket",) if socket_arg is not None else (),
+                )
+            except KasaCliError as exc:
+                emit_error(_to_structured(exc), state["mode"])
+                sys.exit(exc.exit_code)
+            sys.exit(code)
+
+        return _impl
+
+    main.commands["on"] = main.command("on", help="Turn the device on.")(_make("on"))
+    main.commands["off"] = main.command("off", help="Turn the device off.")(_make("off"))
+
+
+def _override_toggle_handler() -> None:
+    @click.argument("target", type=str)
+    @click.option(
+        "--socket",
+        "socket_arg",
+        type=str,
+        default=None,
+        help="Socket index (1-based) or 'all' for multi-socket strips.",
+    )
+    @click.pass_context
+    def _impl(ctx: click.Context, *, target: str, socket_arg: str | None) -> None:
+        state = ctx.obj
+        cfg = _load_config(state["config_path"])
+        run_single = _build_run_toggle_single(cfg, state, socket_arg)
+        try:
+            code = _dispatch_target_or_group(
+                state=state,
+                cfg=cfg,
+                target=target,
+                run_single=run_single,
+                rejects_group=("--socket",) if socket_arg is not None else (),
+            )
+        except KasaCliError as exc:
+            emit_error(_to_structured(exc), state["mode"])
+            sys.exit(exc.exit_code)
+        sys.exit(code)
+
+    main.commands["toggle"] = main.command(
+        "toggle", help="Flip the current on/off state of the device."
+    )(_impl)
+
+
+def _override_set_handler() -> None:
+    @click.argument("target", type=str)
+    @click.option(
+        "--brightness",
+        type=int,
+        default=None,
+        callback=_validate_brightness_range,
+        help="Brightness percent (0-100). Requires a dimmable device.",
+    )
+    @click.option(
+        "--color-temp",
+        "color_temp",
+        type=int,
+        default=None,
+        help="Color temperature in Kelvin. Requires a tunable-white device.",
+    )
+    @click.option(
+        "--hsv",
+        "hsv",
+        type=str,
+        default=None,
+        callback=_validate_color_flag_exclusion,
+        help="Color as 'H,S,V' (e.g. 240,100,100). Mutually exclusive with --hex/--color.",
+    )
+    @click.option(
+        "--hex",
+        "hex_color",
+        type=str,
+        default=None,
+        callback=_validate_color_flag_exclusion,
+        help="Color as #rrggbb hex. Mutually exclusive with --hsv/--color.",
+    )
+    @click.option(
+        "--color",
+        "color_name",
+        type=str,
+        default=None,
+        callback=_validate_color_flag_exclusion,
+        help="Named color (red, blue, warm-white, ...). Mutually exclusive with --hsv/--hex.",
+    )
+    @click.option(
+        "--socket",
+        "socket_arg",
+        type=str,
+        default=None,
+        help="Socket index (1-based) or 'all' for multi-socket strips.",
+    )
+    @click.pass_context
+    def _impl(
+        ctx: click.Context,
+        *,
+        target: str,
+        brightness: int | None,
+        color_temp: int | None,
+        hsv: str | None,
+        hex_color: str | None,
+        color_name: str | None,
+        socket_arg: str | None,
+    ) -> None:
+        state = ctx.obj
+        cfg = _load_config(state["config_path"])
+        run_single = _build_run_set_single(
+            cfg,
+            state,
+            brightness=brightness,
+            color_temp=color_temp,
+            hsv=hsv,
+            hex_color=hex_color,
+            color_name=color_name,
+            socket_arg=socket_arg,
+        )
+        try:
+            code = _dispatch_target_or_group(
+                state=state,
+                cfg=cfg,
+                target=target,
+                run_single=run_single,
+                rejects_group=("--socket",) if socket_arg is not None else (),
+            )
+        except KasaCliError as exc:
+            emit_error(_to_structured(exc), state["mode"])
+            sys.exit(exc.exit_code)
+        sys.exit(code)
+
+    main.commands["set"] = main.command(
+        "set", help="Adjust brightness, color, or color-temperature."
+    )(_impl)
+
+
+def _override_energy_handler() -> None:
+    @click.argument("target", type=str)
+    @click.option(
+        "--socket",
+        "socket_arg",
+        type=int,
+        default=None,
+        help="1-indexed socket on a multi-socket strip (HS300).",
+    )
+    @click.option(
+        "--watch",
+        "watch_seconds",
+        type=float,
+        default=None,
+        help=(
+            "Seconds between ticks. JSONL stream of Reading objects. Sub-second "
+            "values supported (e.g. --watch 0.5)."
+        ),
+    )
+    @click.option(
+        "--cumulative/--no-cumulative",
+        "cumulative_flag",
+        default=None,
+        help=(
+            "Include today_kwh / month_kwh in the Reading. Default: omit under "
+            "--watch (FR-22), include for single-shot reads."
+        ),
+    )
+    @click.pass_context
+    def _impl(
+        ctx: click.Context,
+        *,
+        target: str,
+        socket_arg: int | None,
+        watch_seconds: float | None,
+        cumulative_flag: bool | None,
+    ) -> None:
+        state = ctx.obj
+        cfg = _load_config(state["config_path"])
+        cumulative = (watch_seconds is None) if cumulative_flag is None else cumulative_flag
+        # ``--watch`` is intrinsically single-target; the streaming contract
+        # doesn't apply to a fanned-out group (each member would need its own
+        # endless tick loop). Reject the combo with a clear hint.
+        rejects: tuple[str, ...] = ()
+        if socket_arg is not None:
+            rejects = (*rejects, "--socket")
+        if watch_seconds is not None:
+            rejects = (*rejects, "--watch")
+
+        run_single = _build_run_energy_single(
+            cfg,
+            state,
+            watch_seconds=watch_seconds,
+            cumulative=cumulative,
+            socket=socket_arg,
+        )
+        try:
+            code = _dispatch_target_or_group(
+                state=state,
+                cfg=cfg,
+                target=target,
+                run_single=run_single,
+                rejects_group=rejects,
+            )
+        except KasaCliError as exc:
+            emit_error(_to_structured(exc), state["mode"])
+            sys.exit(exc.exit_code)
+        sys.exit(code)
+
+    main.commands["energy"] = main.command("energy")(_impl)
+
+
+def _override_schedule_list_handler() -> None:
+    @click.argument("target", type=str)
+    @click.pass_context
+    def _impl(ctx: click.Context, *, target: str) -> None:
+        state = ctx.obj
+        cfg = _load_config(state["config_path"])
+        run_single = _build_run_schedule_single(cfg, state)
+        try:
+            code = _dispatch_target_or_group(
+                state=state, cfg=cfg, target=target, run_single=run_single
+            )
+        except KasaCliError as exc:
+            emit_error(_to_structured(exc), state["mode"])
+            sys.exit(exc.exit_code)
+        sys.exit(code)
+
+    schedule_group.commands["list"] = schedule_group.command(
+        "list", help="List device-stored schedule rules (legacy IOT only)."
+    )(_impl)
+
+
+# Wire the overrides at import time so the new dispatchers replace the
+# Phase 1 / Phase 2 single-target ones in the Click registry.
+_override_info_handler()
+_override_onoff_handlers()
+_override_toggle_handler()
+_override_set_handler()
+_override_energy_handler()
+_override_schedule_list_handler()
+
+
+# Suppress unused-import linter warnings on symbols Engineer B3 will pull in.
+_ = (_io, _group_to_text, collect_groups, EXIT_PARTIAL_FAILURE)
