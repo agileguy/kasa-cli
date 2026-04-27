@@ -1,6 +1,6 @@
 [project]
 name = "kasa-cli"
-version = "0.0.0"
+version = "0.1.0"
 description = "Deterministic local-LAN CLI for TP-Link Kasa smart devices"
 readme = "README.md"
 license = { text = "MIT" }
