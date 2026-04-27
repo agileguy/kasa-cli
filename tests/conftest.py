@@ -204,9 +204,7 @@ class _MockAction:
 
     def __init__(self, value: int) -> None:
         self._value = value
-        self.name = {-1: "Disabled", 0: "TurnOff", 1: "TurnOn", 2: "Unknown"}.get(
-            value, "Unknown"
-        )
+        self.name = {-1: "Disabled", 0: "TurnOff", 1: "TurnOn", 2: "Unknown"}.get(value, "Unknown")
 
     def __int__(self) -> int:
         return self._value
@@ -350,9 +348,7 @@ def iot_plug_with_schedule(
     from kasa.module import Module as KasaModule
 
     rules = [
-        make_schedule_rule(
-            rule_id="rule-1", name="Lights on", enable=1, sact=1, smin=22 * 60
-        ),
+        make_schedule_rule(rule_id="rule-1", name="Lights on", enable=1, sact=1, smin=22 * 60),
         make_schedule_rule(
             rule_id="rule-2",
             name="Lights off",

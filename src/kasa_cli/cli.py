@@ -221,6 +221,22 @@ def _load_config(config_path: str | None) -> Config:
     return load_config(path)
 
 
+_LOG_FORMAT: str = (
+    '{"ts":"%(asctime)s","level":"%(levelname)s","logger":"%(name)s","msg":"%(message)s"}'
+)
+
+
+# Sentinel attribute on ``logging.getLogger("kasa_cli")`` recording the path of
+# the currently-attached FileHandler. Lets ``_attach_file_logging`` detect a
+# repeated invocation against the same path and skip duplicate-attach.
+_FILE_HANDLER_SENTINEL: str = "_kasa_cli_file_handler_path"
+
+
+def _log_formatter() -> logging.Formatter:
+    """Return the canonical kasa-cli JSON-line formatter."""
+    return logging.Formatter(_LOG_FORMAT)
+
+
 def _configure_logging(verbose: int) -> None:
     """Wire ``-v`` / ``-vv`` to a stderr JSON-line StreamHandler (FR-39).
 
@@ -237,17 +253,75 @@ def _configure_logging(verbose: int) -> None:
         level = logging.WARNING
 
     handler = logging.StreamHandler(sys.stderr)
-    fmt = '{"ts":"%(asctime)s","level":"%(levelname)s","logger":"%(name)s","msg":"%(message)s"}'
-    handler.setFormatter(logging.Formatter(fmt))
+    handler.setFormatter(_log_formatter())
     root = logging.getLogger("kasa_cli")
     root.setLevel(level)
     for h in list(root.handlers):
         root.removeHandler(h)
+    # Clear the file-handler sentinel — we just removed any FileHandler that
+    # might have been attached previously, so a subsequent
+    # ``_attach_file_logging`` call must not short-circuit.
+    if hasattr(root, _FILE_HANDLER_SENTINEL):
+        delattr(root, _FILE_HANDLER_SENTINEL)
     root.addHandler(handler)
     # Keep propagation enabled so test fixtures (caplog) still receive records.
     # The root logger has no default handler, so propagation is a no-op for
     # ordinary CLI use unless the user has installed one.
     root.propagate = True
+
+
+def _attach_file_logging(cfg: Config | None) -> None:
+    """Tee kasa-cli logs to ``cfg.logging.file`` when set (SRD §7.3).
+
+    Idempotent across re-invocations: if a FileHandler is already attached for
+    the same resolved path on the ``kasa_cli`` logger, nothing happens. If the
+    path changed (tests re-run with a different ``[logging] file =``), the
+    prior FileHandler is removed and a fresh one attached.
+
+    Args:
+        cfg: The active :class:`Config`. ``None`` or empty
+            ``cfg.logging.file`` is a no-op (file logging disabled).
+    """
+    if cfg is None:
+        return
+    file_path_raw = getattr(cfg.logging, "file", None)
+    if not file_path_raw:
+        return
+    path = Path(file_path_raw).expanduser()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        # If we can't create the parent dir, fall back to stderr-only logging
+        # rather than crash the verb. The failure is loud enough at exit time.
+        logging.getLogger("kasa_cli").warning(
+            "could not create log directory for %s; file logging disabled",
+            path,
+        )
+        return
+
+    root = logging.getLogger("kasa_cli")
+    existing = getattr(root, _FILE_HANDLER_SENTINEL, None)
+    if existing == str(path):
+        return  # idempotent — already attached for this path
+
+    # Different path or no prior file handler — drop any stale FileHandler we
+    # previously attached (StreamHandlers from ``_configure_logging`` are
+    # untouched).
+    for h in list(root.handlers):
+        if isinstance(h, logging.FileHandler) and getattr(h, "_kasa_cli_owned", False):
+            root.removeHandler(h)
+            with contextlib.suppress(Exception):
+                h.close()
+
+    handler = logging.FileHandler(path, mode="a", encoding="utf-8")
+    handler.setFormatter(_log_formatter())
+    handler._kasa_cli_owned = True  # type: ignore[attr-defined]
+    root.addHandler(handler)
+    setattr(root, _FILE_HANDLER_SENTINEL, str(path))
+    # SRD §7.3: an INFO line when the tee starts is useful for cron operators
+    # tail-ing the file — it confirms the file is the live log destination
+    # and stamps the run.
+    root.info("file logging enabled at %s", path)
 
 
 def _make_config_lookup(
@@ -325,6 +399,12 @@ def main(
         click.echo("error: --json and --jsonl are mutually exclusive", err=True)
         ctx.exit(EXIT_USAGE_ERROR)
     _configure_logging(verbose)
+    # SRD §7.3: when ``[logging] file = <path>`` is set, tee the same JSON log
+    # lines to that file. Loaded once here so the FileHandler is attached
+    # before any verb runs. We deliberately swallow load errors at this stage —
+    # verbs re-load and surface a structured error if the config is broken.
+    with contextlib.suppress(Exception):
+        _maybe_attach_file_logging(config_path)
     mode = detect_mode(json_flag=json_flag, jsonl_flag=jsonl_flag, quiet=quiet)
     ctx.obj = {
         "mode": mode,
@@ -580,6 +660,132 @@ def auth_flush(ctx: click.Context, *, target: str | None) -> None:
         deleted = auth_cache.flush_all()
     click.echo(f"flushed {deleted} session file(s)")
     sys.exit(EXIT_SUCCESS)
+
+
+# --- Phase 2 Engineer B additions ---------------------------------------------
+#
+# This block adds the ``energy`` verb, ``schedule list`` verb, and the
+# ``_maybe_attach_file_logging`` helper for the runtime log-file tee. It is
+# intentionally appended in a delimited section so the PM merge with Engineer
+# A's color/light-control verbs is mechanical.
+
+
+def _maybe_attach_file_logging(config_path: str | None) -> None:
+    """Load config (best-effort) and call :func:`_attach_file_logging`.
+
+    Used by ``main()`` to wire the SRD §7.3 file-logging tee before any verb
+    runs. A broken config here is suppressed — verbs themselves load the
+    config and surface structured errors. We just want the FileHandler in
+    place if the config loads cleanly.
+    """
+    try:
+        cfg = _load_config(config_path)
+    except KasaCliError:
+        return
+    _attach_file_logging(cfg)
+
+
+# --- energy -------------------------------------------------------------------
+
+
+@main.command("energy")
+@click.argument("target", type=str)
+@click.option(
+    "--socket",
+    "socket_arg",
+    type=int,
+    default=None,
+    help="1-indexed socket on a multi-socket strip (HS300).",
+)
+@click.option(
+    "--watch",
+    "watch_seconds",
+    type=float,
+    default=None,
+    help=(
+        "Seconds between ticks. JSONL stream of Reading objects. Sub-second "
+        "values supported (e.g. --watch 0.5)."
+    ),
+)
+@click.option(
+    "--cumulative/--no-cumulative",
+    "cumulative_flag",
+    default=None,
+    help=(
+        "Include today_kwh / month_kwh in the Reading. Default: omit under "
+        "--watch (FR-22), include for single-shot reads."
+    ),
+)
+@click.pass_context
+def energy_cmd(
+    ctx: click.Context,
+    *,
+    target: str,
+    socket_arg: int | None,
+    watch_seconds: float | None,
+    cumulative_flag: bool | None,
+) -> None:
+    """Emit a Reading (FR-21) or a JSONL stream (--watch, FR-22)."""
+    state = ctx.obj
+    cfg = _load_config(state["config_path"])
+    creds = _resolve_credentials(state["credential_source"], config=cfg, alias=target)
+
+    # FR-22 default: --watch implies --no-cumulative; single-shot includes.
+    cumulative = (watch_seconds is None) if cumulative_flag is None else cumulative_flag
+
+    from kasa_cli.verbs.energy_cmd import run_energy
+
+    code = _run_async(
+        lambda: run_energy(
+            target=target,
+            watch_seconds=watch_seconds,
+            cumulative=cumulative,
+            socket=socket_arg,
+            config_lookup=_make_config_lookup(cfg),
+            credentials=creds,
+            timeout=state["timeout"],
+            mode=state["mode"],
+        ),
+        mode=state["mode"],
+    )
+    sys.exit(code)
+
+
+# --- schedule list ------------------------------------------------------------
+
+
+@main.group("schedule")
+def schedule_group() -> None:
+    """Read-only schedule sub-verbs (legacy IOT only).
+
+    Only ``list`` is exposed in v1. ``add`` / ``remove`` / ``edit`` are out of
+    scope FOREVER per SRD §5.7 FR-25 — schedules belong in cron / systemd /
+    launchd, not in the device. Smart/KLAP devices return exit 5 (FR-24a).
+    """
+
+
+@schedule_group.command("list")
+@click.argument("target", type=str)
+@click.pass_context
+def schedule_list_cmd(ctx: click.Context, *, target: str) -> None:
+    """List device-stored schedule rules (legacy IOT only)."""
+    state = ctx.obj
+    cfg = _load_config(state["config_path"])
+    creds = _resolve_credentials(state["credential_source"], config=cfg, alias=target)
+
+    from kasa_cli.verbs.schedule_cmd import run_schedule_list
+
+    code = _run_async(
+        lambda: run_schedule_list(
+            target=target,
+            config_lookup=_make_config_lookup(cfg),
+            credentials=creds,
+            timeout=state["timeout"],
+            mode=state["mode"],
+        ),
+        mode=state["mode"],
+    )
+    sys.exit(code)
 
 
 __all__ = ["UsageError", "main"]

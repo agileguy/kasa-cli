@@ -70,9 +70,7 @@ async def run_schedule_list(
                     target=target,
                 ) from exc
 
-        rules: list[dict[str, Any]] = [
-            dict(r) for r in await wrapper.read_schedule(kdev)
-        ]
+        rules: list[dict[str, Any]] = [dict(r) for r in await wrapper.read_schedule(kdev)]
     finally:
         disconnect = getattr(kdev, "disconnect", None)
         if disconnect is not None:

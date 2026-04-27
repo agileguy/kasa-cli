@@ -491,9 +491,7 @@ async def read_energy(
         if e is None:
             continue
         saw_any_emeter = True
-        power, voltage, current, today, month = _read_one_emeter(
-            e, cumulative=cumulative
-        )
+        power, voltage, current, today, month = _read_one_emeter(e, cumulative=cumulative)
         total_power += power
         if voltage:
             last_voltage = voltage

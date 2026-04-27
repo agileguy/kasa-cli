@@ -107,9 +107,7 @@ async def test_schedule_list_empty_rule_list_emits_array(
         model="HS103",
         is_on=True,
     )
-    plug.modules = MockModulesMapping(
-        {KasaModule.IotSchedule: MockScheduleModule(rules=[])}
-    )
+    plug.modules = MockModulesMapping({KasaModule.IotSchedule: MockScheduleModule(rules=[])})
 
     async def _fake_connect(*_args: Any, **_kwargs: Any) -> Any:
         return plug

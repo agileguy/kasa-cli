@@ -225,9 +225,7 @@ async def test_energy_watch_emits_two_jsonl_ticks(
         _max_ticks=2,
     )
     assert code == EXIT_SUCCESS
-    out_lines = [
-        line for line in capsys.readouterr().out.splitlines() if line.strip()
-    ]
+    out_lines = [line for line in capsys.readouterr().out.splitlines() if line.strip()]
     assert len(out_lines) >= 2
     for line in out_lines:
         parsed = json.loads(line)
@@ -252,9 +250,7 @@ async def test_energy_watch_no_cumulative_default(
     monkeypatch.setattr("kasa_cli.verbs.energy_cmd.asyncio.sleep", _no_sleep)
 
     captured: list[Reading] = []
-    real_emit_stream = __import__(
-        "kasa_cli.verbs.energy_cmd", fromlist=["emit_stream"]
-    ).emit_stream
+    real_emit_stream = __import__("kasa_cli.verbs.energy_cmd", fromlist=["emit_stream"]).emit_stream
 
     def _spy(items: Any, *args: Any, **kwargs: Any) -> Any:
         for r in items:
@@ -298,9 +294,7 @@ async def test_energy_watch_with_cumulative_includes_kwh(
     monkeypatch.setattr("kasa_cli.verbs.energy_cmd.asyncio.sleep", _no_sleep)
 
     captured: list[Reading] = []
-    real_emit_stream = __import__(
-        "kasa_cli.verbs.energy_cmd", fromlist=["emit_stream"]
-    ).emit_stream
+    real_emit_stream = __import__("kasa_cli.verbs.energy_cmd", fromlist=["emit_stream"]).emit_stream
 
     def _spy(items: Any, *args: Any, **kwargs: Any) -> Any:
         for r in items:
