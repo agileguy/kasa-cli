@@ -30,7 +30,7 @@ import signal
 import sys
 from collections.abc import Callable, Coroutine
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 
 import click
 
@@ -400,6 +400,17 @@ def _devices_section(cfg: Config | None) -> list[dict[str, Any]]:
     ),
 )
 @click.option("-v", "verbose", count=True, help="-v / -vv stderr verbosity.")
+@click.option(
+    "--concurrency",
+    "global_concurrency",
+    type=int,
+    default=10,
+    show_default=True,
+    help=(
+        "Default fan-out concurrency for batch / group operations (FR-28). "
+        "Per-verb flags may override on a case-by-case basis."
+    ),
+)
 @click.pass_context
 def main(
     ctx: click.Context,
@@ -412,6 +423,7 @@ def main(
     credential_source: str | None,
     concurrency_override: int | None,
     verbose: int,
+    global_concurrency: int,
 ) -> None:
     """``kasa-cli`` — deterministic local-LAN CLI for TP-Link Kasa devices."""
     if json_flag and jsonl_flag:
@@ -433,6 +445,7 @@ def main(
         "credential_source": credential_source,
         "concurrency_override": concurrency_override,
         "verbose": verbose,
+        "concurrency": global_concurrency,
     }
 
 
@@ -996,6 +1009,210 @@ def schedule_list_cmd(ctx: click.Context, *, target: str) -> None:
         ),
         mode=state["mode"],
     )
+    sys.exit(code)
+
+
+# --- Phase 3 Engineer B: batch + signal handler ---
+#
+# Adds the ``batch`` verb (FR-30..31b) and the FR-31c graceful-drain
+# SIGINT/SIGTERM handler used by batch (and forward-compatible with
+# Engineer A3's ``group`` fan-out).
+#
+# This section is intentionally appended in a delimited block so the PM
+# merge with A3's territory (groups + global --concurrency flag) is
+# mechanical. The global ``--concurrency`` flag was added inline above
+# under the same delimited-section discipline; if A3 has added the same
+# flag the conflict is a 1-line resolve.
+
+
+def _run_async_graceful(
+    coro_factory: Callable[[asyncio.Event], Coroutine[Any, Any, int]],
+    *,
+    mode: OutputMode,
+    drain_budget_s: float,
+) -> int:
+    """Async runner with FR-31c graceful-drain SIGINT/SIGTERM handling.
+
+    The supplied factory receives the cooperative ``stop_event`` so it can
+    pass it down to ``parallel.run_parallel``. On SIGINT/SIGTERM we set the
+    event (which stops dispatch of new sub-ops) and start a drain timer of
+    ``drain_budget_s`` seconds. If the drain finishes in time, the verb
+    emits its own ``{"event":"interrupted",...}`` summary line and returns
+    naturally; we then override the exit code with 130/143. If the drain
+    runs over budget, we cancel the task; the verb's ``except
+    asyncio.CancelledError`` branch still emits the summary before re-raise.
+
+    For verbs that don't use parallel execution (single-target ``info``,
+    ``on``, ``off``, ...), we keep the simpler runner :func:`_run_async`
+    untouched — there's no per-task stream to summarize and the SIGINT
+    behavior collapses to "cancel + exit 130/143".
+    """
+    received_signal: dict[str, int] = {}
+
+    async def _runner() -> int:
+        loop = asyncio.get_running_loop()
+        stop_event = asyncio.Event()
+
+        def _handle(sig: int) -> None:
+            received_signal["sig"] = sig
+            # Set the event from the loop thread.
+            stop_event.set()
+
+        # Install asyncio-aware handlers — these run on the loop thread, so
+        # the Event.set() is safe and the verb sees the signal at its next
+        # checkpoint.
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            with contextlib.suppress(NotImplementedError, OSError, ValueError):
+                loop.add_signal_handler(sig, _handle, sig)
+
+        task = asyncio.create_task(coro_factory(stop_event))
+        try:
+            return await task
+        except asyncio.CancelledError:
+            # Drain budget exceeded — verb already emitted summary on its
+            # way out. Translate to the right signal exit code.
+            sig_seen = received_signal.get("sig", int(signal.SIGINT))
+            return EXIT_SIGINT if sig_seen == int(signal.SIGINT) else EXIT_SIGTERM
+        finally:
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                with contextlib.suppress(NotImplementedError, OSError, ValueError):
+                    loop.remove_signal_handler(sig)
+            # If the verb is still running after the drain budget, cancel.
+            if not task.done():
+                task.cancel()
+                with contextlib.suppress(BaseException):
+                    await asyncio.wait_for(task, timeout=drain_budget_s)
+
+    try:
+        rc = asyncio.run(_runner())
+    except KasaCliError as exc:
+        emit_error(_to_structured(exc), mode)
+        return exc.exit_code
+    except Exception as exc:
+        err = StructuredError(
+            error="device_error",
+            exit_code=1,
+            target=None,
+            message=f"Unhandled error: {type(exc).__name__}: {exc}",
+            hint=None,
+        )
+        emit_error(err, mode)
+        return 1
+
+    # If a signal was observed, override the natural return code with the
+    # right SRD §11.1 signal code regardless of what the verb returned.
+    sig_seen = received_signal.get("sig")
+    if sig_seen == int(signal.SIGINT):
+        return EXIT_SIGINT
+    if sig_seen == int(signal.SIGTERM):
+        return EXIT_SIGTERM
+    return rc
+
+
+@main.command("batch")
+@click.option(
+    "--file",
+    "file_path",
+    type=click.Path(exists=False, dir_okay=False),
+    default=None,
+    help="Read newline-delimited sub-commands from PATH (FR-30).",
+)
+@click.option(
+    "--stdin",
+    "use_stdin",
+    is_flag=True,
+    default=False,
+    help="Read sub-commands from stdin (FR-31).",
+)
+@click.option(
+    "--concurrency",
+    "concurrency_override",
+    type=int,
+    default=None,
+    help="Override the global --concurrency for this batch only.",
+)
+@click.pass_context
+def batch_cmd(
+    ctx: click.Context,
+    *,
+    file_path: str | None,
+    use_stdin: bool,
+    concurrency_override: int | None,
+) -> None:
+    """Execute a newline-delimited list of sub-commands (FR-30 / FR-31)."""
+    state = ctx.obj
+    mode = state["mode"]
+
+    # FR-31: --file and --stdin are mutually exclusive; one is required.
+    if file_path and use_stdin:
+        raise _Exit64UsageError("--file and --stdin are mutually exclusive")
+    if not file_path and not use_stdin:
+        raise _Exit64UsageError("batch requires either --file <path> or --stdin")
+
+    # Open the source. FR-31b: empty input → exit 0 with [] in JSON mode.
+    source: TextIO
+    if use_stdin:
+        source = sys.stdin
+    else:
+        # Mutex above guarantees ``file_path`` is set when use_stdin is False.
+        assert file_path is not None
+        try:
+            source = open(file_path, encoding="utf-8")  # noqa: SIM115 — closed below
+        except FileNotFoundError:
+            err = StructuredError(
+                error="config_error",
+                exit_code=6,
+                target=None,
+                message=f"batch --file path not found: {file_path}",
+                hint="Pass an existing file or use --stdin.",
+            )
+            emit_error(err, mode)
+            ctx.exit(6)
+            return  # pragma: no cover — ctx.exit raises
+        except OSError as exc:
+            err = StructuredError(
+                error="config_error",
+                exit_code=6,
+                target=None,
+                message=f"batch --file unreadable: {exc}",
+            )
+            emit_error(err, mode)
+            ctx.exit(6)
+            return  # pragma: no cover
+
+    cfg = _load_config(state["config_path"])
+    creds = _resolve_credentials(state["credential_source"], config=cfg)
+
+    concurrency = (
+        concurrency_override
+        if concurrency_override is not None
+        else state.get("concurrency", 10)
+    )
+
+    from kasa_cli.verbs.batch_cmd import DRAIN_BUDGET_SECONDS, run_batch
+
+    def _factory(stop_event: asyncio.Event) -> Coroutine[Any, Any, int]:
+        return run_batch(
+            source=source,
+            mode=mode,
+            config_lookup=_make_config_lookup(cfg),
+            credentials=creds,
+            timeout=state["timeout"],
+            concurrency=concurrency,
+            stop_event=stop_event,
+        )
+
+    try:
+        code = _run_async_graceful(
+            _factory,
+            mode=mode,
+            drain_budget_s=DRAIN_BUDGET_SECONDS,
+        )
+    finally:
+        # Close the file handle if we opened one. stdin we leave alone.
+        if not use_stdin and source is not sys.stdin:
+            with contextlib.suppress(Exception):
+                source.close()
     sys.exit(code)
 
 
