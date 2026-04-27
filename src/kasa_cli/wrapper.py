@@ -35,6 +35,7 @@ from kasa.exceptions import (
     UnsupportedDeviceError,
 )
 from kasa.exceptions import TimeoutError as KasaTimeoutError
+from kasa.module import Module
 
 from kasa_cli.errors import (
     AuthError,
@@ -43,7 +44,7 @@ from kasa_cli.errors import (
     NotFoundError,
     UnsupportedFeatureError,
 )
-from kasa_cli.types import Device, Socket
+from kasa_cli.types import Device, Reading, Socket
 
 if TYPE_CHECKING:
     from kasa import Device as KasaDevice  # noqa: F401  (used only as type)
@@ -303,6 +304,348 @@ async def probe_alive(device: kasa.Device, *, timeout: float) -> bool:
         return True
     except (KasaException, TimeoutError, OSError):
         return False
+
+
+# --- Phase 2 Engineer B additions ---------------------------------------------
+#
+# These helpers cover the SRD §5.6 (Energy) and §5.7 (Schedule) verbs. They are
+# kept inside ``wrapper.py`` so the ``kasa.*`` import boundary stays narrow —
+# verb modules consume the returned dataclasses without touching python-kasa.
+#
+# Engineer A is independently appending light-control helpers (``set_brightness``,
+# ``set_color_temp``, ``set_hsv``) below this section in their own delimited
+# block. The PM merge will concatenate both blocks; do NOT relocate code from
+# this section.
+
+
+def _is_ep40m(model: str | None) -> bool:
+    """Return True for EP40M variants (no hardware emeter — SRD §3.1)."""
+    if not model:
+        return False
+    return model.upper().startswith("EP40M")
+
+
+def _energy_module(kdev: kasa.Device) -> object | None:
+    """Return the :class:`kasa.interfaces.Energy` module on ``kdev`` or ``None``.
+
+    Typed as ``object | None`` rather than ``Energy | None`` because
+    ``kasa_cli.wrapper`` is the sole owner of the ``kasa.*`` boundary and the
+    Energy interface type doesn't need to leak into mypy contexts elsewhere.
+    """
+    modules = getattr(kdev, "modules", None)
+    if modules is None:
+        return None
+    try:
+        result: object | None = modules.get(Module.Energy)
+    except Exception:  # pragma: no cover — defensive
+        return None
+    return result
+
+
+def _coerce_float(value: object) -> float | None:
+    """Best-effort coerce ``value`` to ``float``; ``None`` if it can't be."""
+    if value is None:
+        return None
+    try:
+        return float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+
+
+def _read_one_emeter(
+    energy: object,
+    *,
+    cumulative: bool,
+) -> tuple[float, float, float, float | None, float | None]:
+    """Pull live readings out of one Energy module instance.
+
+    Returns ``(power_w, voltage_v, current_a, today_kwh, month_kwh)``. The
+    cumulative pair is ``(None, None)`` when ``cumulative=False``.
+    """
+    power = _coerce_float(getattr(energy, "current_consumption", None)) or 0.0
+    voltage = _coerce_float(getattr(energy, "voltage", None)) or 0.0
+    current = _coerce_float(getattr(energy, "current", None)) or 0.0
+    today: float | None = None
+    month: float | None = None
+    if cumulative:
+        today = _coerce_float(getattr(energy, "consumption_today", None))
+        month = _coerce_float(getattr(energy, "consumption_this_month", None))
+    return power, voltage, current, today, month
+
+
+async def read_energy(
+    kdev: kasa.Device,
+    *,
+    socket: int | None,
+    cumulative: bool,
+    alias_override: str | None = None,
+) -> Reading:
+    """Return an SRD §10.3 Reading for ``kdev`` (or one of its child sockets).
+
+    Args:
+        kdev: A connected ``kasa.Device``. Caller is responsible for an initial
+            ``update()`` so the Energy module's properties are populated.
+        socket: 1-indexed child socket on a multi-socket strip (HS300). When
+            ``None``, the strip total is returned (parent Energy module if
+            present, otherwise the sum of children's emeters).
+        cumulative: Whether to populate ``today_kwh`` / ``month_kwh``.
+        alias_override: Optional alias to stamp on the Reading; falls back to
+            ``kdev.alias`` (or the child's alias when ``socket`` is set).
+
+    Raises:
+        UnsupportedFeatureError: ``kdev`` lacks an Energy module entirely
+            (e.g., HS200, HS210, EP40M).
+    """
+    model = str(getattr(kdev, "model", "") or "")
+    if _is_ep40m(model):
+        raise UnsupportedFeatureError(
+            (
+                f"EP40M ({model}) is supported as a device but lacks a hardware "
+                "emeter. Energy readings are not available on this model."
+            ),
+            target=getattr(kdev, "alias", None),
+            hint="Use a KP115/KP125/HS110/HS300/EP25 for energy monitoring.",
+        )
+
+    parent_alias = alias_override or str(getattr(kdev, "alias", "") or "")
+
+    # Per-socket path — explicit child query.
+    if socket is not None:
+        children = list(getattr(kdev, "children", []) or [])
+        if not children:
+            raise UnsupportedFeatureError(
+                f"Target {parent_alias!r} has no child sockets; --socket invalid",
+                target=parent_alias,
+            )
+        if socket < 1 or socket > len(children):
+            raise UnsupportedFeatureError(
+                f"--socket {socket} out of range (1..{len(children)}) for {parent_alias!r}",
+                target=parent_alias,
+            )
+        child = children[socket - 1]
+        child_energy = _energy_module(child)
+        if child_energy is None:
+            raise UnsupportedFeatureError(
+                (
+                    f"Socket {socket} on {parent_alias!r} ({model}) does not expose "
+                    "an Energy module on python-kasa 0.10.2."
+                ),
+                target=parent_alias,
+            )
+        power, voltage, current, today, month = _read_one_emeter(
+            child_energy, cumulative=cumulative
+        )
+        child_alias = str(getattr(child, "alias", None) or f"socket-{socket}")
+        return Reading(
+            ts=_utcnow_iso(),
+            alias=child_alias,
+            socket=socket,
+            current_power_w=power,
+            voltage_v=voltage,
+            current_a=current,
+            today_kwh=today,
+            month_kwh=month,
+        )
+
+    # Strip total / single-socket path. Prefer the parent's Energy module if
+    # present (KP115, EP25, etc., and HS300 in some firmware revs); otherwise
+    # sum the child emeters (HS300 firmware revs that only expose per-socket).
+    parent_energy = _energy_module(kdev)
+    if parent_energy is not None:
+        power, voltage, current, today, month = _read_one_emeter(
+            parent_energy, cumulative=cumulative
+        )
+        return Reading(
+            ts=_utcnow_iso(),
+            alias=parent_alias,
+            socket=None,
+            current_power_w=power,
+            voltage_v=voltage,
+            current_a=current,
+            today_kwh=today,
+            month_kwh=month,
+        )
+
+    children = list(getattr(kdev, "children", []) or [])
+    if not children:
+        raise UnsupportedFeatureError(
+            (
+                f"Target {parent_alias!r} ({model}) does not expose energy "
+                "monitoring on python-kasa 0.10.2."
+            ),
+            target=parent_alias,
+            hint="Energy monitoring is supported on HS110/HS300/KP115/KP125/EP25.",
+        )
+
+    # Sum-the-children fallback. Voltage and current are *not* meaningful when
+    # summed (different sockets at different loads), so we surface the parent
+    # voltage from the first child that reports it and the *sum* of currents.
+    total_power = 0.0
+    last_voltage = 0.0
+    total_current = 0.0
+    today_total: float | None = 0.0 if cumulative else None
+    month_total: float | None = 0.0 if cumulative else None
+    saw_any_emeter = False
+    for child in children:
+        e = _energy_module(child)
+        if e is None:
+            continue
+        saw_any_emeter = True
+        power, voltage, current, today, month = _read_one_emeter(e, cumulative=cumulative)
+        total_power += power
+        if voltage:
+            last_voltage = voltage
+        total_current += current
+        if cumulative:
+            if today is not None and today_total is not None:
+                today_total += today
+            if month is not None and month_total is not None:
+                month_total += month
+
+    if not saw_any_emeter:
+        raise UnsupportedFeatureError(
+            (
+                f"Target {parent_alias!r} ({model}) reports children but none expose "
+                "an Energy module."
+            ),
+            target=parent_alias,
+        )
+
+    return Reading(
+        ts=_utcnow_iso(),
+        alias=parent_alias,
+        socket=None,
+        current_power_w=total_power,
+        voltage_v=last_voltage,
+        current_a=total_current,
+        today_kwh=today_total,
+        month_kwh=month_total,
+    )
+
+
+def _format_wday(wday: object) -> str:
+    """Translate python-kasa's 7-element weekday list into a flat label.
+
+    The schedule rule's ``wday`` is a list of 0/1 ints. Index ordering is the
+    device's; we tolerate either Mon-first or Sun-first by emitting names
+    that match the *positions* python-kasa uses upstream (Mon..Sun in the
+    test fixtures). Tools that need machine-precise weekday lookups should
+    consume the rule dict's structured fields directly.
+    """
+    if not isinstance(wday, (list, tuple)):
+        return ""
+    names = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+    enabled: list[str] = []
+    for i, flag in enumerate(wday):
+        if i >= len(names):
+            break
+        try:
+            if int(flag):
+                enabled.append(names[i])
+        except (TypeError, ValueError):
+            continue
+    return ",".join(enabled)
+
+
+def _format_smin(smin: object) -> str:
+    """Render minutes-since-midnight as ``HH:MM``; empty string on garbage."""
+    if not isinstance(smin, (int, float)) or isinstance(smin, bool):
+        return ""
+    try:
+        m = int(smin)
+    except (TypeError, ValueError):
+        return ""
+    if m < 0 or m >= 24 * 60:
+        return ""
+    return f"{m // 60:02d}:{m % 60:02d}"
+
+
+def _action_label(action: object) -> str:
+    """Translate a python-kasa ``Action`` enum (or int) into a flat string."""
+    # Accept the enum, the underlying int, or anything with a ``name`` attr.
+    name = getattr(action, "name", None)
+    if isinstance(name, str):
+        if name == "TurnOn":
+            return "on"
+        if name == "TurnOff":
+            return "off"
+        if name == "Disabled":
+            return "disabled"
+        if name == "Unknown":
+            return "unknown"
+        return name.lower()
+    if not isinstance(action, (int, float)) or isinstance(action, bool):
+        return "unknown"
+    try:
+        as_int = int(action)
+    except (TypeError, ValueError):
+        return "unknown"
+    return {-1: "disabled", 0: "off", 1: "on"}.get(as_int, "unknown")
+
+
+def _rule_to_dict(rule: object) -> dict[str, object]:
+    """Translate one python-kasa ``Rule`` (or rule-shaped object) into a dict."""
+    rule_id = str(getattr(rule, "id", "") or "")
+    enable = bool(getattr(rule, "enable", 0) or 0)
+    repeat = int(getattr(rule, "repeat", 0) or 0)
+    wday_repr = _format_wday(getattr(rule, "wday", None))
+    smin_repr = _format_smin(getattr(rule, "smin", None))
+    action_repr = _action_label(getattr(rule, "sact", None))
+
+    if repeat and wday_repr:
+        time_spec = f"weekly {wday_repr} {smin_repr}".strip()
+    elif smin_repr:
+        time_spec = f"daily {smin_repr}"
+    else:
+        time_spec = "unspecified"
+
+    return {
+        "id": rule_id,
+        "enabled": enable,
+        "time_spec": time_spec,
+        "action": action_repr,
+    }
+
+
+async def read_schedule(kdev: kasa.Device) -> list[dict[str, object]]:
+    """Return the list of rule dicts on ``kdev`` (legacy IOT only).
+
+    Raises:
+        UnsupportedFeatureError: KLAP/Smart device — python-kasa 0.10.2 does
+            not expose a schedule module under ``kasa/smart/modules/``. The
+            error message matches the exact string mandated by SRD FR-24a.
+    """
+    modules = getattr(kdev, "modules", None)
+    schedule_module: object | None = None
+    if modules is not None:
+        try:
+            schedule_module = modules.get(Module.IotSchedule)
+        except Exception:  # pragma: no cover — defensive
+            schedule_module = None
+
+    if schedule_module is None:
+        raise UnsupportedFeatureError(
+            (
+                "python-kasa 0.10.2 does not expose schedule listing for "
+                "KLAP/Smart-protocol devices; revisit when upstream adds a "
+                "Schedule module to kasa/smart/modules/."
+            ),
+            target=getattr(kdev, "alias", None),
+            hint="Use cron / systemd timers / launchd for KLAP devices.",
+        )
+
+    rules_attr = getattr(schedule_module, "rules", None)
+    rules: list[object]
+    if rules_attr is None:
+        rules = []
+    elif callable(rules_attr):
+        try:
+            rules = list(rules_attr())  # support older method-shaped APIs
+        except Exception:
+            rules = []
+    else:
+        rules = list(rules_attr)
+    return [_rule_to_dict(r) for r in rules]
 
 
 # --- Light / dimming helpers (Phase 2) ----------------------------------------
