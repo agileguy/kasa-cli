@@ -60,3 +60,6 @@ dmypy.json
 *.credentials
 .tokens/
 ~/.config/kasa-cli/
+
+# ProjectManager state — local only
+.claude/project-manager-state.json
