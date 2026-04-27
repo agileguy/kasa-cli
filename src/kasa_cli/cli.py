@@ -33,9 +33,9 @@ from typing import Any
 import click
 
 from kasa_cli.errors import (
-    EXIT_SUCCESS,
     EXIT_SIGINT,
     EXIT_SIGTERM,
+    EXIT_SUCCESS,
     EXIT_USAGE_ERROR,
     ConfigError,
     KasaCliError,
