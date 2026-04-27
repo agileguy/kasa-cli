@@ -29,10 +29,10 @@ Sub-command grammar:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import shlex
 import sys
-import contextlib
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Final, TextIO
