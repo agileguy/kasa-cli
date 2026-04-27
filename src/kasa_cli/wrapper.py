@@ -303,3 +303,262 @@ async def probe_alive(device: kasa.Device, *, timeout: float) -> bool:
         return True
     except (KasaException, TimeoutError, OSError):
         return False
+
+
+# --- Light / dimming helpers (Phase 2) ----------------------------------------
+#
+# python-kasa 0.10.x exposes brightness/color/color-temp control via the
+# ``Light`` interface module: ``device.modules.get(Module.Light)`` returns an
+# object with ``set_brightness``, ``set_hsv``, ``set_color_temp`` (or None if
+# the device does not advertise the capability). For multi-socket strips the
+# Light module lives on the per-socket child device, not the parent — callers
+# pass ``socket=N`` (1-indexed) and we route to ``device.children[N-1]``.
+#
+# Capability detection uses the narrower modules (``Module.Brightness``,
+# ``Module.Color``, ``Module.ColorTemperature``) so the verb can return a
+# precise ``unsupported_feature`` exit code per FR-20 (e.g. "this device is
+# dimmable but not color-capable") instead of a generic device error.
+
+
+def _select_target(kdev: kasa.Device, socket: int | None) -> kasa.Device:
+    """Pick the parent device or one of its children based on ``socket``.
+
+    * Single-socket devices accept ``socket=None`` or ``socket=1``; any other
+      explicit socket index is a usage error.
+    * Multi-socket devices REQUIRE an explicit ``socket`` (the verb layer
+      enforces this; the wrapper just trusts what it's handed). ``socket=N``
+      maps to ``children[N-1]`` 1-indexed; out-of-range raises ``UsageError``.
+    """
+    from kasa_cli.errors import UsageError
+
+    children = list(getattr(kdev, "children", None) or [])
+    if not children:
+        if socket is not None and socket != 1:
+            raise UsageError(
+                f"--socket {socket} not valid for single-socket device",
+                target=getattr(kdev, "alias", None),
+            )
+        return kdev
+    if socket is None:
+        # The verb layer enforces the require-socket rule for multi-socket
+        # strips. If we get here without one, the caller has a bug.
+        raise UsageError(
+            "Multi-socket device requires --socket <n> or --socket all",
+            target=getattr(kdev, "alias", None),
+        )
+    if socket < 1 or socket > len(children):
+        raise UsageError(
+            f"--socket {socket} out of range (1..{len(children)})",
+            target=getattr(kdev, "alias", None),
+        )
+    child: kasa.Device = children[socket - 1]
+    return child
+
+
+def _light_module(kdev: kasa.Device) -> object | None:
+    """Return the ``Light`` interface module if the device advertises it."""
+    modules = getattr(kdev, "modules", None)
+    if modules is None:
+        return None
+    try:
+        # Late import: ``kasa.Module`` is part of python-kasa's public API.
+        from kasa import Module
+
+        light = modules.get(Module.Light) if hasattr(modules, "get") else None
+    except (ImportError, AttributeError):
+        return None
+    return light
+
+
+def _has_module(kdev: kasa.Device, module_name: str) -> bool:
+    """Return True if ``kdev.modules`` exposes the named module.
+
+    ``module_name`` is the string attribute on ``kasa.Module`` (e.g.
+    ``"Brightness"``, ``"Color"``, ``"ColorTemperature"``).
+    """
+    modules = getattr(kdev, "modules", None)
+    if modules is None:
+        return False
+    try:
+        from kasa import Module
+
+        mod = getattr(Module, module_name, None)
+    except ImportError:
+        return False
+    if mod is None:
+        return False
+    if hasattr(modules, "__contains__"):
+        try:
+            return mod in modules
+        except TypeError:
+            return False
+    return False
+
+
+async def set_brightness(
+    kdev: kasa.Device,
+    brightness: int,
+    *,
+    socket: int | None = None,
+) -> None:
+    """Set brightness 0..100 on a dimmable device or per-socket child (FR-16).
+
+    Raises :class:`UnsupportedFeatureError` (exit 5) if the device (or the
+    selected socket) does not advertise the ``Brightness`` module. Raises
+    :class:`UsageError` (exit 64) if ``brightness`` is out of range.
+    """
+    from kasa_cli.errors import UsageError
+
+    if not isinstance(brightness, int) or brightness < 0 or brightness > 100:
+        raise UsageError(
+            f"--brightness must be an integer in [0, 100]; got {brightness!r}",
+            target=getattr(kdev, "alias", None),
+        )
+
+    target = _select_target(kdev, socket)
+    if not _has_module(target, "Brightness"):
+        raise UnsupportedFeatureError(
+            "Device does not support brightness control.",
+            target=getattr(target, "alias", None) or getattr(kdev, "alias", None),
+            hint="Only dimmable bulbs/dimmers expose --brightness.",
+        )
+    light = _light_module(target)
+    if light is None or not hasattr(light, "set_brightness"):
+        raise UnsupportedFeatureError(
+            "Device advertises Brightness but no Light module is attached.",
+            target=getattr(target, "alias", None) or getattr(kdev, "alias", None),
+        )
+    try:
+        await light.set_brightness(brightness)
+    except UnsupportedDeviceError as exc:
+        raise UnsupportedFeatureError(
+            f"Brightness rejected: {exc}",
+            target=getattr(target, "alias", None),
+        ) from exc
+    except KasaException as exc:
+        raise DeviceError(
+            f"Brightness command failed: {exc}",
+            target=getattr(target, "alias", None),
+        ) from exc
+
+
+async def set_color_temp(
+    kdev: kasa.Device,
+    kelvin: int,
+    *,
+    socket: int | None = None,
+) -> None:
+    """Set color temperature in kelvin on a tunable-white device (FR-17).
+
+    Clamps to the device's supported range when the Light interface exposes
+    it; otherwise lets python-kasa raise and maps the exception. Raises
+    :class:`UnsupportedFeatureError` if the device lacks ``ColorTemperature``.
+    """
+    from kasa_cli.errors import UsageError
+
+    if not isinstance(kelvin, int) or kelvin <= 0:
+        raise UsageError(
+            f"--color-temp must be a positive integer (kelvin); got {kelvin!r}",
+            target=getattr(kdev, "alias", None),
+        )
+
+    target = _select_target(kdev, socket)
+    if not _has_module(target, "ColorTemperature"):
+        raise UnsupportedFeatureError(
+            "Device does not support color-temperature control.",
+            target=getattr(target, "alias", None) or getattr(kdev, "alias", None),
+            hint="Only tunable-white bulbs expose --color-temp.",
+        )
+    light = _light_module(target)
+    if light is None or not hasattr(light, "set_color_temp"):
+        raise UnsupportedFeatureError(
+            "Device advertises ColorTemperature but no Light module is attached.",
+            target=getattr(target, "alias", None) or getattr(kdev, "alias", None),
+        )
+
+    # Clamp to device-reported range when it advertises one. The canonical
+    # 0.10.x access path is ``light.get_feature("color_temp")`` returning a
+    # Feature with ``minimum_value`` / ``maximum_value`` integers.
+    clamped = kelvin
+    try:
+        feat = light.get_feature("color_temp") if hasattr(light, "get_feature") else None
+    except Exception:  # feature lookup MUST never crash this path
+        feat = None
+    if feat is not None:
+        lo = getattr(feat, "minimum_value", None)
+        hi = getattr(feat, "maximum_value", None)
+        if isinstance(lo, int) and clamped < lo:
+            clamped = lo
+        if isinstance(hi, int) and clamped > hi:
+            clamped = hi
+
+    try:
+        await light.set_color_temp(clamped)
+    except UnsupportedDeviceError as exc:
+        raise UnsupportedFeatureError(
+            f"Color-temp rejected: {exc}",
+            target=getattr(target, "alias", None),
+        ) from exc
+    except KasaException as exc:
+        raise DeviceError(
+            f"Color-temp command failed: {exc}",
+            target=getattr(target, "alias", None),
+        ) from exc
+
+
+async def set_hsv(
+    kdev: kasa.Device,
+    h: int,
+    s: int,
+    v: int,
+    *,
+    socket: int | None = None,
+) -> None:
+    """Set HSV on a color-capable bulb (FR-18 / FR-19 / FR-19a).
+
+    Validates ``0 <= h < 360``, ``0 <= s <= 100``, ``0 <= v <= 100``. Raises
+    :class:`UnsupportedFeatureError` if the device lacks the ``Color`` module.
+    """
+    from kasa_cli.errors import UsageError
+
+    if not (isinstance(h, int) and 0 <= h < 360):
+        raise UsageError(
+            f"--hsv hue must be an integer in [0, 360); got {h!r}",
+            target=getattr(kdev, "alias", None),
+        )
+    if not (isinstance(s, int) and 0 <= s <= 100):
+        raise UsageError(
+            f"--hsv saturation must be an integer in [0, 100]; got {s!r}",
+            target=getattr(kdev, "alias", None),
+        )
+    if not (isinstance(v, int) and 0 <= v <= 100):
+        raise UsageError(
+            f"--hsv value must be an integer in [0, 100]; got {v!r}",
+            target=getattr(kdev, "alias", None),
+        )
+
+    target = _select_target(kdev, socket)
+    if not _has_module(target, "Color"):
+        raise UnsupportedFeatureError(
+            "Device does not support color (HSV) control.",
+            target=getattr(target, "alias", None) or getattr(kdev, "alias", None),
+            hint="Only color bulbs and light strips expose --hsv/--hex/--color.",
+        )
+    light = _light_module(target)
+    if light is None or not hasattr(light, "set_hsv"):
+        raise UnsupportedFeatureError(
+            "Device advertises Color but no Light module is attached.",
+            target=getattr(target, "alias", None) or getattr(kdev, "alias", None),
+        )
+    try:
+        await light.set_hsv(h, s, v)
+    except UnsupportedDeviceError as exc:
+        raise UnsupportedFeatureError(
+            f"HSV rejected: {exc}",
+            target=getattr(target, "alias", None),
+        ) from exc
+    except KasaException as exc:
+        raise DeviceError(
+            f"HSV command failed: {exc}",
+            target=getattr(target, "alias", None),
+        ) from exc

@@ -488,6 +488,150 @@ main.command("on", help="Turn the device on.")(_onoff_command("on"))
 main.command("off", help="Turn the device off.")(_onoff_command("off"))
 
 
+# --- toggle (Phase 2) ---------------------------------------------------------
+
+
+@main.command("toggle", help="Flip the current on/off state of the device.")
+@click.argument("target", type=str)
+@click.option(
+    "--socket",
+    "socket_arg",
+    type=str,
+    default=None,
+    help="Socket index (1-based) or 'all' for multi-socket strips.",
+)
+@click.pass_context
+def toggle_cmd(ctx: click.Context, *, target: str, socket_arg: str | None) -> None:
+    state = ctx.obj
+    cfg = _load_config(state["config_path"])
+    creds = _resolve_credentials(state["credential_source"], config=cfg, alias=target)
+
+    from kasa_cli.verbs.toggle_cmd import run_toggle
+
+    code = _run_async(
+        lambda: run_toggle(
+            target=target,
+            socket_arg=socket_arg,
+            config_lookup=_make_config_lookup(cfg),
+            credentials=creds,
+            timeout=state["timeout"],
+            mode=state["mode"],
+        ),
+        mode=state["mode"],
+    )
+    sys.exit(code)
+
+
+# --- set (Phase 2) ------------------------------------------------------------
+
+
+def _validate_color_flag_exclusion(
+    ctx: click.Context,
+    param: click.Parameter,
+    value: str | None,
+) -> str | None:
+    """Click callback: enforce mutual exclusion of --hsv / --hex / --color.
+
+    Click invokes callbacks left-to-right as flags appear on the command line.
+    We stash the first color-flag we see in ``ctx.ensure_object`` and raise
+    ``click.UsageError`` (which Click renders as exit 2 by default — we override
+    in the verb runner to emit our own exit-64 ``UsageError``).
+    """
+    if value is None:
+        return value
+    seen = ctx.meta.setdefault("_set_color_flags", [])
+    seen.append(param.name)
+    if len(seen) > 1:
+        raise click.UsageError(
+            f"--hsv, --hex, and --color are mutually exclusive; got both "
+            f"--{seen[0].replace('_', '-')} and --{seen[-1].replace('_', '-')}"
+        )
+    return value
+
+
+@main.command("set", help="Adjust brightness, color, or color-temperature.")
+@click.argument("target", type=str)
+@click.option(
+    "--brightness",
+    type=click.IntRange(0, 100),
+    default=None,
+    help="Brightness percent (0-100). Requires a dimmable device.",
+)
+@click.option(
+    "--color-temp",
+    "color_temp",
+    type=int,
+    default=None,
+    help="Color temperature in Kelvin. Requires a tunable-white device.",
+)
+@click.option(
+    "--hsv",
+    "hsv",
+    type=str,
+    default=None,
+    callback=_validate_color_flag_exclusion,
+    help="Color as 'H,S,V' (e.g. 240,100,100). Mutually exclusive with --hex/--color.",
+)
+@click.option(
+    "--hex",
+    "hex_color",
+    type=str,
+    default=None,
+    callback=_validate_color_flag_exclusion,
+    help="Color as #rrggbb hex. Mutually exclusive with --hsv/--color.",
+)
+@click.option(
+    "--color",
+    "color_name",
+    type=str,
+    default=None,
+    callback=_validate_color_flag_exclusion,
+    help="Named color (red, blue, warm-white, ...). Mutually exclusive with --hsv/--hex.",
+)
+@click.option(
+    "--socket",
+    "socket_arg",
+    type=str,
+    default=None,
+    help="Socket index (1-based) or 'all' for multi-socket strips.",
+)
+@click.pass_context
+def set_cmd(
+    ctx: click.Context,
+    *,
+    target: str,
+    brightness: int | None,
+    color_temp: int | None,
+    hsv: str | None,
+    hex_color: str | None,
+    color_name: str | None,
+    socket_arg: str | None,
+) -> None:
+    state = ctx.obj
+    cfg = _load_config(state["config_path"])
+    creds = _resolve_credentials(state["credential_source"], config=cfg, alias=target)
+
+    from kasa_cli.verbs.set_cmd import run_set
+
+    code = _run_async(
+        lambda: run_set(
+            target=target,
+            brightness=brightness,
+            color_temp=color_temp,
+            hsv=hsv,
+            hex_color=hex_color,
+            color_name=color_name,
+            socket_arg=socket_arg,
+            config_lookup=_make_config_lookup(cfg),
+            credentials=creds,
+            timeout=state["timeout"],
+            mode=state["mode"],
+        ),
+        mode=state["mode"],
+    )
+    sys.exit(code)
+
+
 # --- config show / config validate --------------------------------------------
 
 
