@@ -136,3 +136,256 @@ def fake_lookup(
         raise KeyError(target)
 
     return _lookup
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 Engineer B additive fixtures (Energy / Schedule mocks)
+# ---------------------------------------------------------------------------
+
+
+class MockEnergyModule:
+    """Lightweight stand-in for ``kasa.interfaces.Energy``.
+
+    Exposes the same property names as the real interface so the wrapper's
+    ``getattr``-based readout works without any code changes when wired up to
+    a :class:`MockKasaDevice`'s ``modules`` mapping.
+    """
+
+    def __init__(
+        self,
+        *,
+        current_consumption: float | None = 12.5,
+        voltage: float | None = 120.1,
+        current: float | None = 0.105,
+        consumption_today: float | None = 0.250,
+        consumption_this_month: float | None = 7.500,
+    ) -> None:
+        self.current_consumption = current_consumption
+        self.voltage = voltage
+        self.current = current
+        self.consumption_today = consumption_today
+        self.consumption_this_month = consumption_this_month
+
+
+class MockScheduleRule:
+    """Lightweight stand-in for ``kasa.iot.modules.rulemodule.Rule``.
+
+    The wrapper consumes attributes via ``getattr`` so a duck-typed dataclass
+    is sufficient. The shape mirrors python-kasa 0.10.2's ``Rule`` (id, name,
+    enable, wday, repeat, sact, smin, ...).
+    """
+
+    def __init__(
+        self,
+        *,
+        rule_id: str = "rule-1",
+        name: str = "Evening lights",
+        enable: int = 1,
+        wday: list[int] | None = None,
+        repeat: int = 1,
+        sact: int = 1,  # TurnOn
+        smin: int = 22 * 60,  # 22:00
+    ) -> None:
+        self.id = rule_id
+        self.name = name
+        self.enable = enable
+        self.wday = wday or [1, 1, 1, 1, 1, 0, 0]  # weekdays Mon..Fri
+        self.repeat = repeat
+        self.sact = _MockAction(sact)
+        self.smin = smin
+        # End-time fields python-kasa Rule carries but we don't surface.
+        self.eact = None
+        self.etime_opt = None
+        self.emin = None
+
+
+class _MockAction:
+    """Mimics ``kasa.iot.modules.rulemodule.Action`` (an Enum)."""
+
+    def __init__(self, value: int) -> None:
+        self._value = value
+        self.name = {-1: "Disabled", 0: "TurnOff", 1: "TurnOn", 2: "Unknown"}.get(
+            value, "Unknown"
+        )
+
+    def __int__(self) -> int:
+        return self._value
+
+
+class MockScheduleModule:
+    """Lightweight stand-in for ``kasa.iot.modules.schedule.Schedule``."""
+
+    def __init__(self, rules: list[MockScheduleRule] | None = None) -> None:
+        self.rules: list[MockScheduleRule] = list(rules) if rules else []
+
+
+class MockModulesMapping:
+    """Dict-like mapping with ``.get(name)`` lookup mimicking ModuleMapping.
+
+    python-kasa's actual ``Module.Energy`` and ``Module.IotSchedule`` are
+    ``ModuleName`` instances which compare-as-string under ``str()``. We let
+    the test author key the mapping directly with the ``Module.*`` constant
+    they pass in so calls like ``modules.get(Module.Energy)`` round-trip.
+    """
+
+    def __init__(self, payload: dict[Any, Any] | None = None) -> None:
+        self._payload: dict[Any, Any] = dict(payload) if payload else {}
+
+    def get(self, key: Any, default: Any = None) -> Any:
+        return self._payload.get(key, default)
+
+
+@pytest.fixture
+def make_energy_module() -> Callable[..., MockEnergyModule]:
+    """Factory for :class:`MockEnergyModule`."""
+
+    def _factory(**kwargs: Any) -> MockEnergyModule:
+        return MockEnergyModule(**kwargs)
+
+    return _factory
+
+
+@pytest.fixture
+def make_schedule_rule() -> Callable[..., MockScheduleRule]:
+    """Factory for :class:`MockScheduleRule`."""
+
+    def _factory(**kwargs: Any) -> MockScheduleRule:
+        return MockScheduleRule(**kwargs)
+
+    return _factory
+
+
+@pytest.fixture
+def hs300_with_emeters(
+    make_device: Callable[..., MockKasaDevice],
+    make_energy_module: Callable[..., MockEnergyModule],
+) -> MockKasaDevice:
+    """HS300 with per-socket Energy modules but NO parent Energy module."""
+    from kasa.module import Module as KasaModule
+
+    children: list[MockKasaDevice] = []
+    for alias, watts in [("socket-a", 12.5), ("socket-b", 5.0), ("socket-c", 0.0)]:
+        c = make_device(alias=alias, model="HS300", is_on=watts > 0.0)
+        c.modules = MockModulesMapping(  # type: ignore[attr-defined]
+            {KasaModule.Energy: make_energy_module(current_consumption=watts)}
+        )
+        children.append(c)
+    parent = make_device(
+        alias="office-strip",
+        host="192.168.1.51",
+        mac="AA:BB:CC:DD:EE:02",
+        model="HS300(US)",
+        children=children,
+    )
+    # No parent Energy module — exercises the sum-the-children fallback.
+    parent.modules = MockModulesMapping({})  # type: ignore[attr-defined]
+    return parent
+
+
+@pytest.fixture
+def kp115_with_emeter(
+    make_device: Callable[..., MockKasaDevice],
+    make_energy_module: Callable[..., MockEnergyModule],
+) -> MockKasaDevice:
+    """KP115 single-socket plug with a parent Energy module."""
+    from kasa.module import Module as KasaModule
+
+    plug = make_device(
+        alias="kitchen-plug",
+        host="192.168.1.42",
+        mac="AA:BB:CC:DD:EE:03",
+        model="KP115(US)",
+        is_on=True,
+    )
+    plug.modules = MockModulesMapping(  # type: ignore[attr-defined]
+        {KasaModule.Energy: make_energy_module()}
+    )
+    return plug
+
+
+@pytest.fixture
+def hs200_no_emeter(
+    make_device: Callable[..., MockKasaDevice],
+) -> MockKasaDevice:
+    """HS200 wall switch — no Energy module."""
+    sw = make_device(
+        alias="hallway-switch",
+        host="192.168.1.30",
+        mac="AA:BB:CC:DD:EE:04",
+        model="HS200(US)",
+        is_on=True,
+    )
+    sw.modules = MockModulesMapping({})  # type: ignore[attr-defined]
+    return sw
+
+
+@pytest.fixture
+def ep40m_no_emeter(
+    make_device: Callable[..., MockKasaDevice],
+) -> MockKasaDevice:
+    """EP40M outdoor strip — supported as a device but lacks emeter (SRD §3.1)."""
+    from kasa.module import Module as KasaModule
+
+    children = [
+        make_device(alias="ep40m-1", model="EP40M", is_on=False),
+        make_device(alias="ep40m-2", model="EP40M", is_on=False),
+    ]
+    strip = make_device(
+        alias="patio-ep40m",
+        host="192.168.1.78",
+        mac="AA:BB:CC:DD:EE:05",
+        model="EP40M(US)",
+        children=children,
+    )
+    strip.modules = MockModulesMapping({KasaModule.Energy: None})  # type: ignore[attr-defined]
+    return strip
+
+
+@pytest.fixture
+def iot_plug_with_schedule(
+    make_device: Callable[..., MockKasaDevice],
+    make_schedule_rule: Callable[..., MockScheduleRule],
+) -> MockKasaDevice:
+    """A legacy IOT plug exposing two schedule rules."""
+    from kasa.module import Module as KasaModule
+
+    rules = [
+        make_schedule_rule(
+            rule_id="rule-1", name="Lights on", enable=1, sact=1, smin=22 * 60
+        ),
+        make_schedule_rule(
+            rule_id="rule-2",
+            name="Lights off",
+            enable=0,
+            sact=0,
+            smin=6 * 60 + 30,
+            wday=[1, 0, 1, 0, 1, 0, 0],
+        ),
+    ]
+    plug = make_device(
+        alias="iot-plug",
+        host="192.168.1.50",
+        mac="AA:BB:CC:DD:EE:06",
+        model="HS103",
+        is_on=True,
+    )
+    plug.modules = MockModulesMapping(  # type: ignore[attr-defined]
+        {KasaModule.IotSchedule: MockScheduleModule(rules=rules)}
+    )
+    return plug
+
+
+@pytest.fixture
+def klap_plug_no_schedule(
+    make_device: Callable[..., MockKasaDevice],
+) -> MockKasaDevice:
+    """A KLAP/Smart plug — no IotSchedule module."""
+    plug = make_device(
+        alias="klap-plug",
+        host="192.168.1.78",
+        mac="AA:BB:CC:DD:EE:07",
+        model="EP25(US)",
+        is_on=True,
+    )
+    plug.modules = MockModulesMapping({})  # type: ignore[attr-defined]
+    return plug
