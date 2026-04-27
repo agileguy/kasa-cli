@@ -83,10 +83,16 @@ async def test_schedule_list_klap_exits_unsupported_with_srd_message(
             timeout=2.0,
             mode=OutputMode.JSON,
         )
-    msg = str(ei.value)
-    assert "python-kasa 0.10.2 does not expose schedule listing" in msg
-    assert "KLAP/Smart-protocol devices" in msg
-    assert "kasa/smart/modules/" in msg
+    # R1: assert the FULL SRD-mandated message (not just substrings). If the
+    # wrapper text drifts even by one character — punctuation, capitalization,
+    # path — this test catches it. The reviewer flagged loose substring
+    # matching as letting wording rot in unnoticed.
+    expected = (
+        "python-kasa 0.10.2 does not expose schedule listing for "
+        "KLAP/Smart-protocol devices; revisit when upstream adds a "
+        "Schedule module to kasa/smart/modules/."
+    )
+    assert expected in str(ei.value), f"got: {ei.value!r}"
 
 
 @pytest.mark.asyncio

@@ -477,9 +477,19 @@ async def read_energy(
             hint="Energy monitoring is supported on HS110/HS300/KP115/KP125/EP25.",
         )
 
-    # Sum-the-children fallback. Voltage and current are *not* meaningful when
-    # summed (different sockets at different loads), so we surface the parent
-    # voltage from the first child that reports it and the *sum* of currents.
+    # Sum-the-children fallback. Power and current are summed (the strip
+    # really does draw the sum of its sockets); voltage cannot be meaningfully
+    # summed because all sockets share the AC line, so we surface the LAST
+    # non-zero voltage we observed across the children.
+    #
+    # We pick "last non-zero" rather than "first" because:
+    #   1. Children share the AC line — every reporting socket sees the same
+    #      voltage in steady state, so any non-zero reading is correct.
+    #   2. Walking children in order and overwriting on each non-zero read
+    #      makes the implementation a one-liner, and review feedback (C3)
+    #      flagged the prior docstring lie ("first child that reports it"
+    #      while the loop kept overwriting). The contract now matches the
+    #      code: last non-zero wins.
     total_power = 0.0
     last_voltage = 0.0
     total_current = 0.0
@@ -802,6 +812,22 @@ async def set_color_temp(
     if not isinstance(kelvin, int) or kelvin <= 0:
         raise UsageError(
             f"--color-temp must be a positive integer (kelvin); got {kelvin!r}",
+            target=getattr(kdev, "alias", None),
+        )
+    # R3: plausibility guard. Real-world tunable-white bulbs run 2500-6500K;
+    # the broadest physical range that makes sense for any consumer LED is
+    # roughly [1000, 12000]. Values outside that band almost always mean the
+    # user wrote ``--color-temp 27000`` thinking "2700K" or appended an extra
+    # zero by accident. Catch it here with a hint that points at the likely
+    # intent rather than letting the wrapper pass the bogus value to the
+    # device's clamp logic, which would silently clip to e.g. 6500K and
+    # apply a setting nobody asked for.
+    if not (1000 <= kelvin <= 12000):
+        raise UsageError(
+            (
+                f"--color-temp {kelvin}K is outside the plausible range "
+                f"[1000, 12000]; did you mean {kelvin // 10}K?"
+            ),
             target=getattr(kdev, "alias", None),
         )
 

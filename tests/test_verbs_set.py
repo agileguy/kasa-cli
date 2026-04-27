@@ -230,6 +230,50 @@ async def test_set_color_temp_clamps_below_minimum(
 
 
 @pytest.mark.asyncio
+async def test_set_color_temp_implausible_value_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+    fake_lookup: Callable[[str], tuple[str | None, str | None]],
+) -> None:
+    """R3: ``--color-temp 27000`` (likely typo for 2700K) raises UsageError.
+
+    Real-world tunable LEDs run [2500, 6500]K. Anything outside [1000, 12000]
+    is almost certainly a "wrote 27000 instead of 2700" mistake. The wrapper
+    catches it BEFORE device resolution's clamp path, so the user gets a
+    clear error pointing at the likely intended value rather than a silently
+    clamped device setting they didn't ask for.
+    """
+    from kasa_cli.errors import UsageError as KasaUsageError
+
+    bulb = _make_color_bulb()
+
+    async def _fake_connect(*_args: Any, **_kwargs: Any) -> Any:
+        return bulb
+
+    monkeypatch.setattr("kasa.Device.connect", _fake_connect)
+
+    with pytest.raises(KasaUsageError) as ei:
+        await run_set(
+            target="kitchen-lamp",
+            brightness=None,
+            color_temp=27000,
+            hsv=None,
+            hex_color=None,
+            color_name=None,
+            socket_arg=None,
+            config_lookup=fake_lookup,
+            credentials=CredentialBundle(),
+            timeout=1.0,
+            mode=OutputMode.JSONL,
+        )
+    msg = str(ei.value)
+    assert "27000K" in msg
+    assert "2700K" in msg  # the suggested likely-intended value
+    # Device's set_color_temp must NOT have been called.
+    assert bulb.light_module is not None
+    assert bulb.light_module.color_temp_calls == []
+
+
+@pytest.mark.asyncio
 async def test_set_hsv_happy(
     monkeypatch: pytest.MonkeyPatch,
     fake_lookup: Callable[[str], tuple[str | None, str | None]],

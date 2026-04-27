@@ -258,6 +258,15 @@ def _configure_logging(verbose: int) -> None:
     root.setLevel(level)
     for h in list(root.handlers):
         root.removeHandler(h)
+        # R2: FileHandlers own an open file descriptor — removing them from
+        # the logger doesn't close the FD. Without this `h.close()` repeated
+        # invocations of ``_configure_logging`` (tests, long-lived processes)
+        # leak FDs proportional to the number of reconfigurations. Other
+        # handler types are no-ops on close, so an unconditional best-effort
+        # close is safe.
+        if isinstance(h, logging.FileHandler):
+            with contextlib.suppress(Exception):
+                h.close()
     # Clear the file-handler sentinel — we just removed any FileHandler that
     # might have been attached previously, so a subsequent
     # ``_attach_file_logging`` call must not short-circuit.
@@ -605,6 +614,20 @@ def toggle_cmd(ctx: click.Context, *, target: str, socket_arg: str | None) -> No
 # --- set (Phase 2) ------------------------------------------------------------
 
 
+class _Exit64UsageError(click.UsageError):
+    """Click ``UsageError`` subclass that exits with SRD-mandated 64, not 2.
+
+    The base ``click.UsageError`` defaults to ``exit_code = 2``; SRD §11.1
+    FR-20 requires usage errors (mutex flag violations, out-of-range values,
+    missing required args) to exit ``64`` so they're distinguishable from
+    auth failures (exit 2). Both ``CliRunner`` (test path, ``standalone_mode
+    =True``) and the production ``__main__`` shim consult ``exc.exit_code``
+    when translating the exception, so this single subclass fixes both paths.
+    """
+
+    exit_code = 64
+
+
 def _validate_color_flag_exclusion(
     ctx: click.Context,
     param: click.Parameter,
@@ -613,19 +636,50 @@ def _validate_color_flag_exclusion(
     """Click callback: enforce mutual exclusion of --hsv / --hex / --color.
 
     Click invokes callbacks left-to-right as flags appear on the command line.
-    We stash the first color-flag we see in ``ctx.ensure_object`` and raise
-    ``click.UsageError`` (which Click renders as exit 2 by default — we override
-    in the verb runner to emit our own exit-64 ``UsageError``).
+    We stash each color-flag we see in ``ctx.meta`` and raise our own
+    :class:`_Exit64UsageError` on the second occurrence so the exit code is the
+    SRD-mandated ``64`` (FR-20). The default ``click.UsageError`` would exit 2,
+    which collides with the auth-failure exit code.
     """
     if value is None:
         return value
+    # Map Python attribute names back to the user-facing CLI flag name.
+    # ``--hex`` is bound to ``hex_color`` and ``--color`` to ``color_name``;
+    # the rest match (e.g. ``hsv`` ↔ ``--hsv``).
+    flag_name_for_attr = {
+        "hsv": "hsv",
+        "hex_color": "hex",
+        "color_name": "color",
+    }
     seen = ctx.meta.setdefault("_set_color_flags", [])
     seen.append(param.name)
     if len(seen) > 1:
-        raise click.UsageError(
-            f"--hsv, --hex, and --color are mutually exclusive; got both "
-            f"--{seen[0].replace('_', '-')} and --{seen[-1].replace('_', '-')}"
+        first = flag_name_for_attr.get(seen[0], seen[0].replace("_", "-"))
+        last = flag_name_for_attr.get(seen[-1], seen[-1].replace("_", "-"))
+        raise _Exit64UsageError(
+            f"--hsv, --hex, and --color are mutually exclusive; got both --{first} and --{last}"
         )
+    return value
+
+
+def _validate_brightness_range(
+    ctx: click.Context,
+    param: click.Parameter,
+    value: int | None,
+) -> int | None:
+    """Click callback: bound ``--brightness`` to [0, 100] with exit 64.
+
+    ``click.IntRange`` would reject out-of-range values with exit 2 (Click's
+    default ``UsageError``). FR-20 requires exit 64 for usage errors, so we
+    accept a plain ``int`` and validate here, raising :class:`_Exit64UsageError`
+    on violation. ``ctx`` and ``param`` are unused but required by the Click
+    callback signature.
+    """
+    del ctx, param
+    if value is None:
+        return None
+    if value < 0 or value > 100:
+        raise _Exit64UsageError(f"--brightness must be in [0, 100]; got {value}")
     return value
 
 
@@ -633,8 +687,9 @@ def _validate_color_flag_exclusion(
 @click.argument("target", type=str)
 @click.option(
     "--brightness",
-    type=click.IntRange(0, 100),
+    type=int,
     default=None,
+    callback=_validate_brightness_range,
     help="Brightness percent (0-100). Requires a dimmable device.",
 )
 @click.option(

@@ -158,6 +158,45 @@ def emit(
     s.write("\n")
 
 
+def emit_one(
+    item: object,
+    mode: OutputMode,
+    *,
+    formatter: Callable[[object], str],
+    stream: TextIO | None = None,
+) -> None:
+    """Emit a single streaming record AND flush the stream.
+
+    Same rendering as :func:`emit` for ``TEXT`` / ``JSONL`` (a single line per
+    item) but with an explicit ``flush()`` after the write so live consumers
+    (e.g. ``--watch`` tailers, downstream pipes) see each tick the moment it
+    lands rather than after the underlying buffer fills.
+
+    ``JSON`` mode emits the bare item as a pretty-printed top-level value; this
+    is the right shape for a one-shot fetch but is NOT meaningful for streamed
+    iteration. Callers streaming under ``JSON`` mode should buffer and call
+    :func:`emit_stream` once at the end so the output is a single JSON array
+    (which is the `--json` contract). ``QUIET`` writes nothing.
+    """
+    s = stream if stream is not None else sys.stdout
+    if mode is OutputMode.QUIET:
+        return
+    if mode is OutputMode.TEXT:
+        s.write(formatter(item))
+        s.write("\n")
+        s.flush()
+        return
+    if mode is OutputMode.JSON:
+        s.write(_safe_dumps(item, pretty=True))
+        s.write("\n")
+        s.flush()
+        return
+    # JSONL
+    s.write(_safe_dumps(item, pretty=False))
+    s.write("\n")
+    s.flush()
+
+
 def emit_stream(
     items: Iterable[object],
     mode: OutputMode,

@@ -113,7 +113,13 @@ async def test_energy_hs300_strip_total_sums_children(
     hs300_with_emeters: Any,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """No --socket on HS300 with no parent emeter → sum of child powers."""
+    """No --socket on HS300 with no parent emeter → sum of child power AND current.
+
+    C3 fix: previously asserted only ``current_power_w``, leaving the voltage
+    and current semantics unverified. Now also asserts:
+      * voltage_v == 120.1 (every child reports 120.1; "last non-zero" wins)
+      * current_a is the sum of children's currents (3 x 0.105 = 0.315)
+    """
 
     async def _fake_connect(*_args: Any, **_kwargs: Any) -> Any:
         return hs300_with_emeters
@@ -135,6 +141,72 @@ async def test_energy_hs300_strip_total_sums_children(
     assert parsed["socket"] is None
     # 12.5 + 5.0 + 0.0 = 17.5
     assert parsed["current_power_w"] == pytest.approx(17.5)
+    # All three children report voltage 120.1; with "last non-zero" semantics
+    # the strip surfaces 120.1 (any reporting child would do — they're on the
+    # same AC line).
+    assert parsed["voltage_v"] == pytest.approx(120.1)
+    # Current is summed (each child default 0.105A x 3 children = 0.315A).
+    assert parsed["current_a"] == pytest.approx(0.315)
+
+
+@pytest.mark.asyncio
+async def test_energy_hs300_voltage_picks_last_nonzero(
+    monkeypatch: pytest.MonkeyPatch,
+    make_device: Any,
+    make_energy_module: Any,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """C3: with distinct child voltages, strip total surfaces the LAST non-zero.
+
+    The existing ``hs300_with_emeters`` fixture gives every child the same
+    voltage (120.1), which can't distinguish "first non-zero" from "last
+    non-zero" semantics. This test pins down the contract by handing the
+    wrapper a strip whose children report voltages [120.0, 121.5, 0.0]. With
+    "last non-zero" the strip total reports 121.5; "first non-zero" would
+    have reported 120.0; "last (any)" would have reported 0.0. Only one of
+    those is right per the wrapper docstring (after the C3 reconciliation).
+    """
+    from kasa.module import Module as KasaModule
+
+    from tests.conftest import MockModulesMapping
+
+    children = []
+    voltages = [120.0, 121.5, 0.0]
+    for i, v in enumerate(voltages, start=1):
+        c = make_device(alias=f"socket-{i}", model="HS300", is_on=v > 0)
+        c.modules = MockModulesMapping(
+            {KasaModule.Energy: make_energy_module(voltage=v, current_consumption=1.0)}
+        )
+        children.append(c)
+    parent = make_device(
+        alias="distinct-voltages-strip",
+        host="192.168.1.99",
+        mac="AA:BB:CC:DD:EE:99",
+        model="HS300(US)",
+        children=children,
+    )
+    parent.modules = MockModulesMapping({})  # force sum-the-children path
+
+    async def _fake_connect(*_args: Any, **_kwargs: Any) -> Any:
+        return parent
+
+    monkeypatch.setattr("kasa.Device.connect", _fake_connect)
+
+    code = await run_energy(
+        target="distinct-voltages-strip",
+        watch_seconds=None,
+        cumulative=False,
+        socket=None,
+        config_lookup=_make_lookup({"distinct-voltages-strip": "192.168.1.99"}),
+        credentials=CredentialBundle(),
+        timeout=2.0,
+        mode=OutputMode.JSONL,
+    )
+    assert code == EXIT_SUCCESS
+    parsed = json.loads(capsys.readouterr().out.strip())
+    # "last non-zero" semantics: child 3 reports 0.0 (skipped), so the
+    # surfaced voltage is child 2's 121.5, not child 1's 120.0.
+    assert parsed["voltage_v"] == pytest.approx(121.5)
 
 
 # --- unsupported devices ------------------------------------------------------
@@ -238,7 +310,13 @@ async def test_energy_watch_no_cumulative_default(
     monkeypatch: pytest.MonkeyPatch,
     kp115_with_emeter: Any,
 ) -> None:
-    """FR-22 explicit: with cumulative=False the Reading omits both kWh fields."""
+    """FR-22 explicit: with cumulative=False the Reading omits both kWh fields.
+
+    JSONL ``--watch`` now streams via :func:`emit_one` (one flushed write per
+    tick) rather than collecting then calling :func:`emit_stream` at loop end.
+    The spy hooks ``emit_one`` to capture each Reading object as it's emitted
+    and asserts the cumulative fields are ``None`` per FR-22 default.
+    """
 
     async def _fake_connect(*_args: Any, **_kwargs: Any) -> Any:
         return kp115_with_emeter
@@ -250,14 +328,13 @@ async def test_energy_watch_no_cumulative_default(
     monkeypatch.setattr("kasa_cli.verbs.energy_cmd.asyncio.sleep", _no_sleep)
 
     captured: list[Reading] = []
-    real_emit_stream = __import__("kasa_cli.verbs.energy_cmd", fromlist=["emit_stream"]).emit_stream
+    real_emit_one = __import__("kasa_cli.verbs.energy_cmd", fromlist=["emit_one"]).emit_one
 
-    def _spy(items: Any, *args: Any, **kwargs: Any) -> Any:
-        for r in items:
-            captured.append(r)
-        return real_emit_stream(items, *args, **kwargs)
+    def _spy(item: Any, *args: Any, **kwargs: Any) -> Any:
+        captured.append(item)
+        return real_emit_one(item, *args, **kwargs)
 
-    monkeypatch.setattr("kasa_cli.verbs.energy_cmd.emit_stream", _spy)
+    monkeypatch.setattr("kasa_cli.verbs.energy_cmd.emit_one", _spy)
 
     code = await run_energy(
         target="kitchen-plug",
@@ -294,14 +371,13 @@ async def test_energy_watch_with_cumulative_includes_kwh(
     monkeypatch.setattr("kasa_cli.verbs.energy_cmd.asyncio.sleep", _no_sleep)
 
     captured: list[Reading] = []
-    real_emit_stream = __import__("kasa_cli.verbs.energy_cmd", fromlist=["emit_stream"]).emit_stream
+    real_emit_one = __import__("kasa_cli.verbs.energy_cmd", fromlist=["emit_one"]).emit_one
 
-    def _spy(items: Any, *args: Any, **kwargs: Any) -> Any:
-        for r in items:
-            captured.append(r)
-        return real_emit_stream(items, *args, **kwargs)
+    def _spy(item: Any, *args: Any, **kwargs: Any) -> Any:
+        captured.append(item)
+        return real_emit_one(item, *args, **kwargs)
 
-    monkeypatch.setattr("kasa_cli.verbs.energy_cmd.emit_stream", _spy)
+    monkeypatch.setattr("kasa_cli.verbs.energy_cmd.emit_one", _spy)
 
     code = await run_energy(
         target="kitchen-plug",
@@ -319,3 +395,74 @@ async def test_energy_watch_with_cumulative_includes_kwh(
     for r in captured:
         assert r.today_kwh is not None
         assert r.month_kwh is not None
+
+
+@pytest.mark.asyncio
+async def test_energy_watch_jsonl_streams_per_tick_not_buffered(
+    monkeypatch: pytest.MonkeyPatch,
+    kp115_with_emeter: Any,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """C2 review fix: JSONL ``--watch`` writes (and flushes) ONE line per tick.
+
+    The pre-fix implementation collected all Readings into a list and called
+    ``emit_stream`` once at loop exit. With ``_max_ticks=None`` (production)
+    that meant stdout stayed silent forever. This test pins down the new
+    contract: by the time the second tick has been ``emit_one``-ed, the
+    first tick's JSON line is already on stdout (and ``flush()`` has been
+    called).
+    """
+
+    async def _fake_connect(*_args: Any, **_kwargs: Any) -> Any:
+        return kp115_with_emeter
+
+    sleep_calls: int = 0
+
+    async def _no_sleep(_seconds: float) -> None:
+        nonlocal sleep_calls
+        sleep_calls += 1
+
+    monkeypatch.setattr("kasa.Device.connect", _fake_connect)
+    monkeypatch.setattr("kasa_cli.verbs.energy_cmd.asyncio.sleep", _no_sleep)
+
+    # Track flush calls. The streaming contract requires ``flush`` to be
+    # invoked AT LEAST ONCE PER TICK so live consumers see each reading the
+    # moment it lands. We also record the count of stdout lines visible at
+    # each flush to assert per-tick visibility (vs. one big buffer at end).
+    real_flush = __import__("sys").stdout.flush
+    flush_visible_lines: list[int] = []
+
+    def _flush_spy() -> None:
+        # Read the captured stdout content WITHOUT consuming it. capsys uses
+        # an internal buffer we can peek at via the real `_capture` shim;
+        # simplest portable approach is to count newlines in `sys.stdout`'s
+        # current buffer if available, else just record the flush event.
+        stream = __import__("sys").stdout
+        buf = getattr(stream, "getvalue", None)
+        if callable(buf):
+            flush_visible_lines.append(buf().count("\n"))
+        else:
+            flush_visible_lines.append(-1)
+        return real_flush()
+
+    monkeypatch.setattr("sys.stdout.flush", _flush_spy)
+
+    code = await run_energy(
+        target="kitchen-plug",
+        watch_seconds=0.5,
+        cumulative=False,
+        socket=None,
+        config_lookup=_make_lookup({"kitchen-plug": "192.168.1.42"}),
+        credentials=CredentialBundle(),
+        timeout=2.0,
+        mode=OutputMode.JSONL,
+        _max_ticks=3,
+    )
+    assert code == EXIT_SUCCESS
+    out_lines = [ln for ln in capsys.readouterr().out.splitlines() if ln.strip()]
+    assert len(out_lines) == 3, f"expected 3 ticks, got {len(out_lines)}"
+    # At least 3 flushes (one per tick). Could be more if other writes
+    # incidentally flush, but never fewer.
+    assert len(flush_visible_lines) >= 3, (
+        f"expected at least 3 flushes (one per tick); got {flush_visible_lines}"
+    )

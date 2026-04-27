@@ -24,7 +24,7 @@ from collections.abc import Callable
 
 from kasa_cli import wrapper
 from kasa_cli.errors import EXIT_SUCCESS, DeviceError
-from kasa_cli.output import OutputMode, emit, emit_stream, reading_to_text
+from kasa_cli.output import OutputMode, emit, emit_one, emit_stream, reading_to_text
 from kasa_cli.types import Reading
 from kasa_cli.wrapper import CredentialBundle
 
@@ -57,16 +57,29 @@ async def run_energy(
 ) -> int:
     """Execute the ``energy`` verb. Returns the desired exit code on success.
 
+    Streaming behaviour under ``--watch`` (FR-22):
+        * **JSONL / TEXT** — one Reading per tick is written to stdout AND
+          flushed inside the loop, so live consumers see each line the moment
+          the tick fires (well before the next tick interval elapses). This
+          fixes the C2 review bug where readings buffered until loop exit and
+          stayed invisible under the production ``_max_ticks=None`` path.
+        * **JSON** — readings are buffered into a single JSON array and
+          emitted once at loop end (``--watch --json`` therefore requires a
+          bounded run; SIGINT during an unbounded run produces no output).
+          SRD §5.6 documents JSONL as the canonical streaming format.
+        * **QUIET** — nothing reaches stdout but ticks still iterate.
+
     Args:
         target: Alias / IP / MAC the user passed.
-        watch_seconds: ``None`` for single-shot; ``> 0`` for JSONL stream.
+        watch_seconds: ``None`` for single-shot; ``> 0`` for streamed ticks.
         cumulative: Include ``today_kwh`` / ``month_kwh`` in the Reading.
         socket: 1-indexed socket on HS300; ``None`` for strip total or single
             socket.
         config_lookup: Closure resolving ``target`` to ``(host, alias)``.
         credentials: Pre-resolved credentials.
         timeout: Per-operation connect timeout.
-        mode: Output mode for stdout.
+        mode: Output mode for stdout. Streaming behaviour varies by mode —
+            see the section above.
         _max_ticks: Internal test hook. When set, the watch loop emits at most
             this many Readings before returning. Production callers SHOULD
             leave it ``None``; the loop runs until interrupted.
@@ -94,29 +107,53 @@ async def run_energy(
             emit(reading, mode, formatter=lambda r: reading_to_text(r))  # type: ignore[arg-type]
             return EXIT_SUCCESS
 
-        # ``--watch`` mode: JSONL stream. We pass through ``mode`` unchanged
-        # so ``--json`` mode still produces a single array (collected eagerly
-        # via emit_stream); the streaming-by-default behaviour is what users
-        # get on a pipe.
-        async def _ticks() -> AsyncReadingIter:
-            return AsyncReadingIter(
-                kdev=kdev,
-                target=target,
-                socket=socket,
-                cumulative=cumulative,
-                alias_override=alias_override,
-                interval=float(watch_seconds),
-                max_ticks=_max_ticks,
-            )
+        # ``--watch`` mode.
+        #
+        # Streaming contract by mode (FR-22):
+        #   * JSONL / TEXT — emit one Reading per tick INSIDE the loop and
+        #     flush stdout immediately so live consumers see each line the
+        #     moment it lands. Production runs use ``_max_ticks=None`` and the
+        #     loop runs until SIGINT — buffering would mean stdout stays
+        #     silent until the process is killed (the C2 review bug).
+        #   * JSON — collect ticks into a single array and emit ONCE at the
+        #     end so the document is a syntactically valid top-level JSON
+        #     array. Under ``_max_ticks=None`` this never returns naturally;
+        #     ``--watch --json`` is therefore only useful with a bounded run
+        #     (Ctrl-C still produces a partial buffer, never emitted). This
+        #     is acceptable: SRD §5.6 documents JSONL as the canonical
+        #     streaming format; ``--json`` is an array-or-nothing contract.
+        #   * QUIET — drop everything; we still iterate so device state
+        #     refreshes happen for any caller relying on side effects, but
+        #     nothing reaches stdout.
+        readings_iter = AsyncReadingIter(
+            kdev=kdev,
+            target=target,
+            socket=socket,
+            cumulative=cumulative,
+            alias_override=alias_override,
+            interval=float(watch_seconds),
+            max_ticks=_max_ticks,
+        )
 
-        readings_iter = await _ticks()
-        # Collect into a list when emit_stream needs JSON-array semantics
-        # (mode == JSON); for JSONL/TEXT we materialize anyway because
-        # emit_stream is a sync iterator. The async iteration happens here.
-        collected: list[Reading] = []
+        if mode is OutputMode.JSON:
+            collected: list[Reading] = []
+            async for r in readings_iter:
+                collected.append(r)
+            emit_stream(
+                collected,
+                mode,
+                formatter=lambda r: reading_to_text(r),  # type: ignore[arg-type]
+            )
+            return EXIT_SUCCESS
+
+        # JSONL / TEXT / QUIET — stream per-tick (flushed) so the FIRST line
+        # appears before the SECOND tick fires.
         async for r in readings_iter:
-            collected.append(r)
-        emit_stream(collected, mode, formatter=lambda r: reading_to_text(r))  # type: ignore[arg-type]
+            emit_one(
+                r,
+                mode,
+                formatter=lambda reading: reading_to_text(reading),  # type: ignore[arg-type]
+            )
         return EXIT_SUCCESS
     finally:
         disconnect = getattr(kdev, "disconnect", None)
