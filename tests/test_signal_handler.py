@@ -88,9 +88,7 @@ def _spawn_batch(
     )
 
 
-def _wait_for_first_line(
-    proc: subprocess.Popen[str], *, timeout_s: float = 4.0
-) -> None:
+def _wait_for_first_line(proc: subprocess.Popen[str], *, timeout_s: float = 4.0) -> None:
     """Block until at least one stdout line lands or timeout. Best-effort.
 
     We can't actually do a non-blocking line-read on a Popen stdout pipe in

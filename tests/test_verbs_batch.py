@@ -61,9 +61,7 @@ def _make_source(text: str) -> io.StringIO:
 async def test_parallel_all_success_returns_zero() -> None:
     targets = ["a", "b", "c"]
     results = {t: TaskResult(target=t, success=True, exit_code=0) for t in targets}
-    agg = await parallel.run_parallel(
-        targets, _stub_dispatch(results), concurrency=4
-    )
+    agg = await parallel.run_parallel(targets, _stub_dispatch(results), concurrency=4)
     assert agg.exit_code == EXIT_SUCCESS
     assert agg.successes == 3
     assert agg.failures == 0
@@ -80,9 +78,7 @@ async def test_parallel_mixed_returns_seven() -> None:
             error=StructuredError(error="auth_failed", exit_code=2, message="x"),
         ),
     }
-    agg = await parallel.run_parallel(
-        ["a", "b"], _stub_dispatch(results), concurrency=4
-    )
+    agg = await parallel.run_parallel(["a", "b"], _stub_dispatch(results), concurrency=4)
     assert agg.exit_code == EXIT_PARTIAL_FAILURE
 
 
@@ -102,9 +98,7 @@ async def test_parallel_all_same_failure_returns_homogeneous_code() -> None:
             error=StructuredError(error="auth_failed", exit_code=2, message="y"),
         ),
     }
-    agg = await parallel.run_parallel(
-        ["a", "b"], _stub_dispatch(results), concurrency=4
-    )
+    agg = await parallel.run_parallel(["a", "b"], _stub_dispatch(results), concurrency=4)
     assert agg.exit_code == EXIT_AUTH_ERROR
 
 
@@ -262,9 +256,7 @@ async def test_batch_all_same_failure_exits_with_homogeneous_code(
             target=target,
             success=False,
             exit_code=EXIT_AUTH_ERROR,
-            error=StructuredError(
-                error="auth_failed", exit_code=EXIT_AUTH_ERROR, message="x"
-            ),
+            error=StructuredError(error="auth_failed", exit_code=EXIT_AUTH_ERROR, message="x"),
         )
 
     import kasa_cli.verbs.batch_cmd as batch_mod

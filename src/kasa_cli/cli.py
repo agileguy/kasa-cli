@@ -389,26 +389,16 @@ def _devices_section(cfg: Config | None) -> list[dict[str, Any]]:
     type=click.Choice(["env", "file", "none"]),
     default=None,
 )
-@click.option(
-    "--concurrency",
-    "concurrency_override",
-    type=int,
-    default=None,
-    help=(
-        "Override [defaults] concurrency for this invocation (FR-28). "
-        "Applies to @group fanout and (Phase 3 Engineer B3) batch."
-    ),
-)
 @click.option("-v", "verbose", count=True, help="-v / -vv stderr verbosity.")
 @click.option(
     "--concurrency",
     "global_concurrency",
     type=int,
-    default=10,
-    show_default=True,
+    default=None,
     help=(
-        "Default fan-out concurrency for batch / group operations (FR-28). "
-        "Per-verb flags may override on a case-by-case basis."
+        "Default fan-out concurrency for @group / batch operations (FR-28). "
+        "Overrides [defaults] concurrency from config when set; otherwise "
+        "config value (default 10) wins."
     ),
 )
 @click.pass_context
@@ -421,9 +411,8 @@ def main(
     timeout: float,
     config_path: str | None,
     credential_source: str | None,
-    concurrency_override: int | None,
     verbose: int,
-    global_concurrency: int,
+    global_concurrency: int | None,
 ) -> None:
     """``kasa-cli`` — deterministic local-LAN CLI for TP-Link Kasa devices."""
     if json_flag and jsonl_flag:
@@ -443,8 +432,9 @@ def main(
         "timeout": timeout,
         "config_path": config_path,
         "credential_source": credential_source,
-        "concurrency_override": concurrency_override,
         "verbose": verbose,
+        # global_concurrency=None means "use config default"; group/batch verbs
+        # resolve via _resolve_concurrency() that consults config when unset.
         "concurrency": global_concurrency,
     }
 
@@ -1183,11 +1173,14 @@ def batch_cmd(
     cfg = _load_config(state["config_path"])
     creds = _resolve_credentials(state["credential_source"], config=cfg)
 
-    concurrency = (
-        concurrency_override
-        if concurrency_override is not None
-        else state.get("concurrency", 10)
-    )
+    if concurrency_override is not None and concurrency_override > 0:
+        concurrency = int(concurrency_override)
+    else:
+        concurrency = (
+            _resolve_concurrency(state, cfg)
+            if cfg is not None
+            else (state.get("concurrency") or 10)
+        )
 
     from kasa_cli.verbs.batch_cmd import DRAIN_BUDGET_SECONDS, run_batch
 
@@ -1301,12 +1294,12 @@ def _resolve_concurrency(state: dict[str, Any], cfg: Config) -> int:
     """Pick the effective concurrency cap.
 
     Resolution order (highest priority first):
-        1. ``--concurrency N`` CLI flag (state['concurrency_override']),
+        1. ``--concurrency N`` global CLI flag (``state['concurrency']``),
         2. ``[defaults] concurrency`` from the loaded config,
         3. Built-in default (``DEFAULT_CONCURRENCY = 10``) — already baked
            into the Config dataclass.
     """
-    override = state.get("concurrency_override")
+    override = state.get("concurrency")
     if override is not None and override > 0:
         return int(override)
     return int(cfg.defaults.concurrency)

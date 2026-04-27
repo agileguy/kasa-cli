@@ -32,6 +32,7 @@ import asyncio
 import json
 import shlex
 import sys
+import contextlib
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Final, TextIO
@@ -519,19 +520,36 @@ async def run_batch(
 
     interrupted = False
 
-    def _on_signal() -> None:
+    # Bridge B3's external stop_event semantics into A3's on_signal-callback-registration
+    # contract. A3's run_parallel calls on_signal(register_stop_fn) once at start; we
+    # capture the stop callable, and a watcher task fires it when cli.py's stop_event
+    # is set. This keeps batch_cmd.py oblivious to A3's internal stop mechanism.
+    stop_fn_holder: list[Callable[[], None] | None] = [None]
+
+    def _register_stop(stop_fn: Callable[[], None]) -> None:
+        nonlocal interrupted
+        stop_fn_holder[0] = stop_fn
+        # Mark interrupted=True only when the actual stop fires; here we just save it.
+
+    async def _watch_external_stop_event() -> None:
+        if stop_event is None:
+            return
+        await stop_event.wait()
         nonlocal interrupted
         interrupted = True
+        fn = stop_fn_holder[0]
+        if fn is not None:
+            fn()
 
     aggregate: AggregateResult
+    watch_task = asyncio.create_task(_watch_external_stop_event())
     try:
         aggregate = await parallel.run_parallel(
             targets,
             _dispatch_for_target,
             concurrency=concurrency,
-            on_signal=_on_signal,
-            stop_event=stop_event,
-            on_result=_on_result,
+            on_signal=_register_stop,
+            on_each=_on_result,
         )
     except asyncio.CancelledError:
         # We were cancelled mid-flight (FR-31c drain budget exceeded).
@@ -541,11 +559,18 @@ async def run_batch(
         pending = max(0, len(parsed_lines) - completed)
         _flush_token_cache_pending()
         _emit_interrupted_summary(
-            completed=completed, pending=pending, stream=out, mode=mode,
+            completed=completed,
+            pending=pending,
+            stream=out,
+            mode=mode,
         )
         # Re-raise so the CLI _run_async sees the cancellation and emits
         # the right exit code (130 or 143).
         raise
+    finally:
+        watch_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await watch_task
 
     # If the stop_event fired but we drained successfully, emit the summary
     # but still return the aggregate exit code (the CLI overrides with
@@ -555,7 +580,10 @@ async def run_batch(
         pending = max(0, len(parsed_lines) - completed)
         _flush_token_cache_pending()
         _emit_interrupted_summary(
-            completed=completed, pending=pending, stream=out, mode=mode,
+            completed=completed,
+            pending=pending,
+            stream=out,
+            mode=mode,
         )
         # Note: FR-31c says "exit with 130 or 143" — the cli.py signal
         # handler returns those codes. Return whatever the aggregate would
