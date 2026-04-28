@@ -105,9 +105,7 @@ def test_built_in_defaults_when_no_file_present(
     so the test doesn't accidentally load the operator's real config file.
     """
     monkeypatch.delenv("KASA_CLI_CONFIG", raising=False)
-    monkeypatch.setattr(
-        cfg_mod, "_default_config_path", lambda: tmp_path / "does-not-exist.toml"
-    )
+    monkeypatch.setattr(cfg_mod, "_default_config_path", lambda: tmp_path / "does-not-exist.toml")
     caplog.set_level(logging.INFO, logger="kasa_cli")
     config = cfg_mod.load_config()
     assert config.source_path is None
