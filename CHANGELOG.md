@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] — 2026-04-27
+
+Five wrapper bugs surfaced when running v0.3.0 against an actual LAN of KL125 / HS103 / KL400L5 devices for the first time. None caught by mock-based unit tests; all of them caught by the new live-device test suite.
+
+### Fixed
+- **`to_device_record` raised `KasaException`** on devices returned by `Discover.discover()` before any `update()` call. python-kasa property accessors raise instead of returning a default; `getattr(..., default)` doesn't catch it. New `_safe_attr()` helper is `KasaException`-tolerant; routed all 6 `getattr` sites through it.
+- **`--target-network 192.168.86.0/24` (CIDR) silently failed** with `[Errno 8] nodename nor servname provided`. python-kasa's `Discover.discover(target=)` expects a literal IP. New `_resolve_target_network()` converts CIDR → broadcast IP via `ipaddress.ip_network().broadcast_address`. Literal IPs pass through unchanged. Invalid input → exit 64 with an actionable hint.
+- **`Device.connect(host=, config=)` was rejected** with *"One of host or config must be provded and not both"*. DeviceConfig already carries the host; we now pass `config=` only.
+- **`_has_module()` looked for non-existent `Module.Brightness`** etc. python-kasa 0.10.x exposes brightness/color/color-temp as **features of the Light module** on most legacy IOT devices, NOT as separate modules. Switched to feature-dict-based detection (`kdev.features` keys: `brightness`, `hsv`, `color_temperature`).
+- **`DEFAULT_CONFIG_PATH` frozen at import time** — tests monkeypatching `HOME` / `Path.home()` couldn't override. Now lazily computed via `_default_config_path()`. Three unit tests that leaked the operator's real config now run hermetically.
+
+### Added
+- `tests/test_live_device.py` — 13 live-device integration tests gated on `KASA_TEST_DEVICE_IP` env var per SRD §12.2. CI never sets this; locally:
+    ```bash
+    KASA_TEST_DEVICE_IP=192.168.86.249 \
+    KASA_TEST_DEVICE_ALIAS=chair \
+    KASA_TEST_DEVICE_MAC=14:EB:B6:E7:7F:22 \
+    uv run pytest tests/test_live_device.py -v
+    ```
+- Each test that mutates state captures the initial state and restores it on teardown.
+
+### Notes
+- 353 unit tests + 12 of 13 live tests pass against a KL125 bulb. Still 353 in CI (live tests deliberately skipped).
+- The release-notes pattern that recurred across all four releases — *first real-world run uncovers bugs that perfect mocks hide* — is the fundamental limitation of mock-based testing. Live-device tests are now part of the suite and will catch the next class of bug as it appears.
+
 ## [0.3.0] — 2026-04-27
 
 Phase 3 per [docs/SRD-kasa-cli.md](docs/SRD-kasa-cli.md) §16.3 — final implementation phase. v0.3.0 ships the full SRD-compliant feature set; Phase 4 is a no-commitment placeholder per the SRD.
