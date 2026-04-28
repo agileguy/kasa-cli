@@ -43,7 +43,19 @@ VALID_OUTPUT_FORMATS: Final[frozenset[str]] = frozenset({"auto", "text", "json",
 
 ENV_CONFIG_PATH: Final[str] = "KASA_CLI_CONFIG"
 
+# Computed lazily at load time (not at module import) so tests can redirect
+# ``$HOME`` via ``monkeypatch.setattr(Path, "home", ...)`` without patching
+# this constant separately. See _default_config_path() below.
 DEFAULT_CONFIG_PATH: Final[Path] = Path("~/.config/kasa-cli/config.toml").expanduser()
+
+
+def _default_config_path() -> Path:
+    """Return the default config-file path, resolved at call time.
+
+    Honors $HOME / Path.home() at the moment of the call. Tests that
+    redirect HOME / Path.home() rely on this not being cached at import.
+    """
+    return Path("~/.config/kasa-cli/config.toml").expanduser()
 
 
 # ---------------------------------------------------------------------------
@@ -238,7 +250,7 @@ def _resolve_path(explicit_path: Path | None) -> tuple[Path | None, bool]:
     if env_value:
         return Path(env_value).expanduser(), True
 
-    return DEFAULT_CONFIG_PATH, False
+    return _default_config_path(), False
 
 
 def _parse_and_validate(raw: bytes, path: Path) -> Config:

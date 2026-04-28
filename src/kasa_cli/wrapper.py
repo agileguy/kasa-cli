@@ -23,10 +23,11 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import ipaddress
 import math
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import kasa
 from kasa.exceptions import (
@@ -43,6 +44,7 @@ from kasa_cli.errors import (
     NetworkError,
     NotFoundError,
     UnsupportedFeatureError,
+    UsageError,
 )
 from kasa_cli.types import Device, Reading, Socket
 
@@ -85,10 +87,32 @@ def _detect_protocol(device: kasa.Device) -> Literal["legacy", "klap"]:
     return "legacy"
 
 
+def _safe_attr(obj: object, name: str, default: Any = None) -> Any:
+    """``getattr`` that also catches python-kasa's pre-update KasaException.
+
+    python-kasa property accessors raise ``KasaException("You need to await
+    update() to access the data")`` when called on devices that have only been
+    discovered (no ``update()`` round-trip yet). ``getattr(..., default)``
+    doesn't catch this — it only catches ``AttributeError``. The discover
+    code path returns devices that have *some* fields populated from the
+    discovery response (alias, host, mac, model, hw_info, sys_info,
+    config.connection_type) but NOT others (is_on, children, features). This
+    helper lets us read the safe fields and gracefully fall back on the rest.
+    """
+    try:
+        return getattr(obj, name, default)
+    except KasaException:
+        return default
+
+
 def _features_of(device: kasa.Device) -> list[str]:
-    """Translate python-kasa's feature dict into the SRD's flat string list."""
+    """Translate python-kasa's feature dict into the SRD's flat string list.
+
+    Pre-update devices return an empty list (``Device.features`` is not
+    populated until ``update()`` lands).
+    """
     out: list[str] = []
-    feats = getattr(device, "features", None)
+    feats = _safe_attr(device, "features", None)
     if isinstance(feats, dict):
         keys = sorted(feats.keys())
         out.extend(keys)
@@ -96,29 +120,39 @@ def _features_of(device: kasa.Device) -> list[str]:
 
 
 def _sockets_of(device: kasa.Device) -> list[Socket] | None:
-    """Build the Socket list for multi-socket strips, or None."""
-    children = getattr(device, "children", None)
+    """Build the Socket list for multi-socket strips, or None.
+
+    Pre-update devices return ``None`` (``Device.children`` is not populated
+    until ``update()``).
+    """
+    children = _safe_attr(device, "children", None)
     if not children:
         return None
     sockets: list[Socket] = []
     for index, child in enumerate(children, start=1):
-        alias = getattr(child, "alias", None) or f"socket-{index}"
-        is_on = bool(getattr(child, "is_on", False))
+        alias = _safe_attr(child, "alias", None) or f"socket-{index}"
+        is_on = bool(_safe_attr(child, "is_on", False))
         sockets.append(Socket(index=index, alias=alias, state="on" if is_on else "off"))
     return sockets
 
 
 def _state_of(device: kasa.Device) -> Literal["on", "off", "mixed"]:
-    """Return ``"on"``, ``"off"``, or ``"mixed"`` for the device or strip."""
-    children = getattr(device, "children", None)
+    """Return ``"on"``, ``"off"``, or ``"mixed"`` for the device or strip.
+
+    Pre-update devices report ``"off"`` because ``Device.is_on`` is not
+    populated until ``update()``. The discover output's ``state`` field is
+    advisory in that case; callers that need a real state must call ``info``
+    (which issues an explicit ``update()``).
+    """
+    children = _safe_attr(device, "children", None)
     if children:
-        states = [bool(getattr(c, "is_on", False)) for c in children]
+        states = [bool(_safe_attr(c, "is_on", False)) for c in children]
         if all(states):
             return "on"
         if not any(states):
             return "off"
         return "mixed"
-    return "on" if bool(getattr(device, "is_on", False)) else "off"
+    return "on" if bool(_safe_attr(device, "is_on", False)) else "off"
 
 
 def to_device_record(
@@ -131,17 +165,20 @@ def to_device_record(
     ``alias_override`` lets callers stamp a config-resolved alias when the
     device's stored alias is empty or differs.
     """
-    hw_info = getattr(kdev, "hw_info", {}) or {}
-    sys_info = getattr(kdev, "sys_info", {}) or {}
-    # python-kasa exposes hw_info and sys_info as dicts that vary by family.
-    # Use string-coerced lookups with sane fallbacks.
+    # All accesses go through _safe_attr because pre-update devices (returned
+    # by Discover.discover before any update() call) raise KasaException on
+    # property reads instead of AttributeError. _safe_attr swallows that and
+    # returns the default — discovery output is best-effort for everything
+    # except alias/host/mac/model which the discovery response populates.
+    hw_info = _safe_attr(kdev, "hw_info", {}) or {}
+    sys_info = _safe_attr(kdev, "sys_info", {}) or {}
     hw_version = str(hw_info.get("hw_ver") or sys_info.get("hw_ver") or sys_info.get("hwVer") or "")
     fw_version = str(hw_info.get("sw_ver") or sys_info.get("sw_ver") or sys_info.get("swVer") or "")
     return Device(
-        alias=alias_override or getattr(kdev, "alias", "") or "",
-        ip=str(getattr(kdev, "host", "") or ""),
-        mac=_normalize_mac(getattr(kdev, "mac", None)),
-        model=str(getattr(kdev, "model", "") or ""),
+        alias=alias_override or _safe_attr(kdev, "alias", "") or "",
+        ip=str(_safe_attr(kdev, "host", "") or ""),
+        mac=_normalize_mac(_safe_attr(kdev, "mac", None)),
+        model=str(_safe_attr(kdev, "model", "") or ""),
         hardware_version=hw_version,
         firmware_version=fw_version,
         protocol=_detect_protocol(kdev),
@@ -215,9 +252,11 @@ async def resolve_target(
     # the original float for sub-second cancellation precision.
     device_timeout = max(1, math.ceil(timeout))
     try:
+        # python-kasa's Device.connect rejects passing BOTH host= and config=
+        # ("One of host or config must be provded and not both"). DeviceConfig
+        # already carries the host, so we pass only that.
         kdev = await asyncio.wait_for(
             kasa.Device.connect(
-                host=host,
                 config=kasa.DeviceConfig(host=host, credentials=creds, timeout=device_timeout),
             ),
             timeout=timeout,
@@ -252,6 +291,35 @@ async def resolve_target(
     return kdev
 
 
+def _resolve_target_network(value: str | None) -> str | None:
+    """Convert ``--target-network`` input to a directed-broadcast IP.
+
+    Accepts either a CIDR (``192.168.1.0/24``) or a literal broadcast IP
+    (``192.168.1.255``). python-kasa's ``Discover.discover(target=...)``
+    expects a literal IP — passing a CIDR results in ``[Errno 8] nodename
+    nor servname provided, or not known`` followed by a zero-result outcome.
+    """
+    if value is None:
+        return None
+    if "/" not in value:
+        return value
+    try:
+        net = ipaddress.ip_network(value, strict=False)
+    except ValueError as exc:
+        raise UsageError(
+            f"--target-network {value!r} is not a valid CIDR or IP address",
+            hint="Use either a CIDR (192.168.1.0/24) or a broadcast IP (192.168.1.255).",
+        ) from exc
+    if isinstance(net, ipaddress.IPv4Network):
+        return str(net.broadcast_address)
+    # IPv6 multicast/link-local for SSDP-style discovery is not supported by
+    # python-kasa today; surface an actionable error.
+    raise UsageError(
+        f"--target-network {value!r}: IPv6 networks are not supported",
+        hint="Pass an IPv4 CIDR or broadcast address.",
+    )
+
+
 async def discover(
     *,
     timeout: float,
@@ -260,16 +328,18 @@ async def discover(
 ) -> list[Device]:
     """Broadcast-discover devices on the LAN (SRD §5.1).
 
-    ``target_network`` is the directed-broadcast address (e.g.
-    ``192.168.1.255``) — callers are responsible for converting a CIDR. When
+    ``target_network`` may be a CIDR (``192.168.1.0/24``) or a literal
+    directed-broadcast IP (``192.168.1.255``); CIDRs are normalized to the
+    network's broadcast address before being passed to python-kasa. When
     ``None`` we use python-kasa's default ``255.255.255.255`` and let the OS
     pick the interface (FR-5b's documented limitation on macOS multi-NIC).
     """
+    resolved_target = _resolve_target_network(target_network)
     kwargs: dict[str, object] = {
         "discovery_timeout": int(max(1, timeout)),
     }
-    if target_network is not None:
-        kwargs["target"] = target_network
+    if resolved_target is not None:
+        kwargs["target"] = resolved_target
     if credentials.is_present:
         kwargs["username"] = credentials.username
         kwargs["password"] = credentials.password
@@ -724,28 +794,41 @@ def _light_module(kdev: kasa.Device) -> object | None:
 
 
 def _has_module(kdev: kasa.Device, module_name: str) -> bool:
-    """Return True if ``kdev.modules`` exposes the named module.
+    """Return True if the device supports the capability named by ``module_name``.
 
-    ``module_name`` is the string attribute on ``kasa.Module`` (e.g.
-    ``"Brightness"``, ``"Color"``, ``"ColorTemperature"``).
+    Capability detection uses python-kasa's **feature dict** (``kdev.features``)
+    rather than the modules collection. python-kasa 0.10.x exposes brightness /
+    color / color-temperature as **features of the Light module**, not as
+    separate ``Module.Brightness`` / ``Module.Color`` / ``Module.ColorTemperature``
+    entries on most legacy IOT devices (KL125, KL400L5, etc.). Checking for
+    the feature key is the durable detection pattern.
+
+    ``module_name`` maps to the feature key as follows:
+
+    +-------------------+-----------------------------+
+    | module_name       | python-kasa feature key     |
+    +===================+=============================+
+    | "Brightness"      | "brightness"                |
+    | "Color"           | "hsv"                       |
+    | "ColorTemperature"| "color_temperature"         |
+    +-------------------+-----------------------------+
+
+    A pre-update device returns False for everything (its feature dict isn't
+    populated yet); the verb layer is expected to have called ``update()``
+    before this check via ``resolve_target``.
     """
-    modules = getattr(kdev, "modules", None)
-    if modules is None:
+    feature_for_module: dict[str, str] = {
+        "Brightness": "brightness",
+        "Color": "hsv",
+        "ColorTemperature": "color_temperature",
+    }
+    feature_key = feature_for_module.get(module_name)
+    if feature_key is None:
         return False
-    try:
-        from kasa import Module
-
-        mod = getattr(Module, module_name, None)
-    except ImportError:
+    feats = _safe_attr(kdev, "features", None)
+    if not isinstance(feats, dict):
         return False
-    if mod is None:
-        return False
-    if hasattr(modules, "__contains__"):
-        try:
-            return mod in modules
-        except TypeError:
-            return False
-    return False
+    return feature_key in feats
 
 
 async def set_brightness(

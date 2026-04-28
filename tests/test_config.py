@@ -85,14 +85,27 @@ def test_default_path_used_when_no_overrides(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     default = _write(tmp_path, "default.toml", "[defaults]\nconcurrency = 25\n")
-    monkeypatch.setattr(cfg_mod, "DEFAULT_CONFIG_PATH", default)
+    # _default_config_path is computed lazily so the test patches the function
+    # rather than the module-level constant. (Pre-v0.3.1 the constant was
+    # frozen at import time and tests patched the constant directly.)
+    monkeypatch.setattr(cfg_mod, "_default_config_path", lambda: default)
     config = cfg_mod.load_config()
     assert config.source_path == default
     assert config.defaults.concurrency == 25
 
 
-def test_built_in_defaults_when_no_file_present(caplog: pytest.LogCaptureFixture) -> None:
-    """FR-40b — default-path miss is informational, not an error."""
+def test_built_in_defaults_when_no_file_present(
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """FR-40b — default-path miss is informational, not an error.
+
+    Hermeticity: redirect ``_default_config_path()`` to a non-existent path
+    so the test doesn't accidentally load the operator's real config file.
+    """
+    monkeypatch.delenv("KASA_CLI_CONFIG", raising=False)
+    monkeypatch.setattr(cfg_mod, "_default_config_path", lambda: tmp_path / "does-not-exist.toml")
     caplog.set_level(logging.INFO, logger="kasa_cli")
     config = cfg_mod.load_config()
     assert config.source_path is None
