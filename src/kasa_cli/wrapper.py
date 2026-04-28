@@ -252,9 +252,11 @@ async def resolve_target(
     # the original float for sub-second cancellation precision.
     device_timeout = max(1, math.ceil(timeout))
     try:
+        # python-kasa's Device.connect rejects passing BOTH host= and config=
+        # ("One of host or config must be provded and not both"). DeviceConfig
+        # already carries the host, so we pass only that.
         kdev = await asyncio.wait_for(
             kasa.Device.connect(
-                host=host,
                 config=kasa.DeviceConfig(host=host, credentials=creds, timeout=device_timeout),
             ),
             timeout=timeout,
@@ -792,28 +794,41 @@ def _light_module(kdev: kasa.Device) -> object | None:
 
 
 def _has_module(kdev: kasa.Device, module_name: str) -> bool:
-    """Return True if ``kdev.modules`` exposes the named module.
+    """Return True if the device supports the capability named by ``module_name``.
 
-    ``module_name`` is the string attribute on ``kasa.Module`` (e.g.
-    ``"Brightness"``, ``"Color"``, ``"ColorTemperature"``).
+    Capability detection uses python-kasa's **feature dict** (``kdev.features``)
+    rather than the modules collection. python-kasa 0.10.x exposes brightness /
+    color / color-temperature as **features of the Light module**, not as
+    separate ``Module.Brightness`` / ``Module.Color`` / ``Module.ColorTemperature``
+    entries on most legacy IOT devices (KL125, KL400L5, etc.). Checking for
+    the feature key is the durable detection pattern.
+
+    ``module_name`` maps to the feature key as follows:
+
+    +-------------------+-----------------------------+
+    | module_name       | python-kasa feature key     |
+    +===================+=============================+
+    | "Brightness"      | "brightness"                |
+    | "Color"           | "hsv"                       |
+    | "ColorTemperature"| "color_temperature"         |
+    +-------------------+-----------------------------+
+
+    A pre-update device returns False for everything (its feature dict isn't
+    populated yet); the verb layer is expected to have called ``update()``
+    before this check via ``resolve_target``.
     """
-    modules = getattr(kdev, "modules", None)
-    if modules is None:
+    feature_for_module: dict[str, str] = {
+        "Brightness": "brightness",
+        "Color": "hsv",
+        "ColorTemperature": "color_temperature",
+    }
+    feature_key = feature_for_module.get(module_name)
+    if feature_key is None:
         return False
-    try:
-        from kasa import Module
-
-        mod = getattr(Module, module_name, None)
-    except ImportError:
+    feats = _safe_attr(kdev, "features", None)
+    if not isinstance(feats, dict):
         return False
-    if mod is None:
-        return False
-    if hasattr(modules, "__contains__"):
-        try:
-            return mod in modules
-        except TypeError:
-            return False
-    return False
+    return feature_key in feats
 
 
 async def set_brightness(

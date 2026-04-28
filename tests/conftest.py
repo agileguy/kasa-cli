@@ -149,7 +149,21 @@ class MockKasaDevice:
         self.model = model
         self.hw_info = hw_info or {"hw_ver": "1.0", "sw_ver": "1.5.6"}
         self.sys_info = sys_info or {}
-        self.features = features or {"on": True}
+        # Capabilities map to python-kasa feature keys (see wrapper._has_module).
+        # MockKasaDevice tests pass capabilities=("Brightness", "Color", "ColorTemperature")
+        # — translate those to feature-dict entries so wrapper's
+        # features-based capability detection sees them.
+        capability_to_feature: dict[str, str] = {
+            "Brightness": "brightness",
+            "Color": "hsv",
+            "ColorTemperature": "color_temperature",
+        }
+        derived_features = dict(features) if features else {"on": True}
+        for cap in capabilities or ():
+            feature_key = capability_to_feature.get(cap)
+            if feature_key is not None:
+                derived_features.setdefault(feature_key, True)
+        self.features = derived_features
         self.is_on = is_on
         self.children: list[MockKasaDevice] = list(children) if children else []
         self.config = None  # protocol detection falls through to "legacy"
@@ -160,10 +174,8 @@ class MockKasaDevice:
         self.turn_off_called = 0
         self.update_called = 0
         self.disconnect_called = 0
-        # Phase 2 capability surface.
+        # Modules surface — Light is the only one wrapper.set_* helpers reach for.
         entries: dict[str, object] = {}
-        for name in capabilities or ():
-            entries[name] = True
         if light_module is not None:
             entries["Light"] = light_module
         self.light_module = light_module

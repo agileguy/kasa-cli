@@ -218,12 +218,20 @@ async def test_run_groups_list_quiet_mode_emits_nothing(
 def test_cli_groups_list_with_no_config_emits_empty_array(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """No config file present -> empty groups -> exit 0, ``[]`` in JSON."""
+    """Empty config file -> empty groups -> exit 0, ``[]`` in JSON.
+
+    Hermeticity: explicitly point ``--config`` at a tmp empty TOML file so
+    the test doesn't accidentally read the operator's real
+    ``~/.config/kasa-cli/config.toml`` (a real $HOME-set monkeypatch would
+    not work because ``Path.expanduser`` reads $HOME directly without
+    going through the patchable ``Path.home()``).
+    """
     monkeypatch.delenv("KASA_CLI_CONFIG", raising=False)
-    monkeypatch.setenv("HOME", str(tmp_path))
+    empty_cfg = tmp_path / "config.toml"
+    empty_cfg.write_text("")
 
     runner = CliRunner()
-    result = runner.invoke(cli_main, ["--json", "groups", "list"])
+    result = runner.invoke(cli_main, ["--config", str(empty_cfg), "--json", "groups", "list"])
     assert result.exit_code == EXIT_SUCCESS, f"stderr: {result.stderr}"
     parsed = json.loads(result.stdout)
     assert parsed == []
