@@ -77,15 +77,29 @@ def test_aggregate_exit_code_all_fail_homogeneous_returns_first_code() -> None:
     assert aggregate_exit_code(results) == EXIT_NETWORK_ERROR
 
 
-def test_aggregate_exit_code_all_fail_mixed_reasons_returns_first() -> None:
-    """All fail, different reasons -> first task's code wins (deterministic)."""
+def test_aggregate_exit_code_all_fail_mixed_reasons_returns_seven() -> None:
+    """All fail, different reasons -> exit 7 per SRD §11.1 closing paragraph.
+
+    SRD §11.1: "Mixed-failure-reasons SHALL still exit 7 — the structured
+    stderr error names the dominant failure." Homogeneous all-failure still
+    returns the shared reason's code (see test above), but mixed reasons
+    collapse to ``EXIT_PARTIAL_FAILURE``.
+    """
     results = [
         _fail("a", EXIT_AUTH_ERROR, "auth_failed"),
         _fail("b", EXIT_NETWORK_ERROR, "network_error"),
     ]
-    # Per FR-29a: when EVERY sub-op failed, the exit code is the FIRST
-    # failure's code. Mixed-reasons does NOT collapse to 7 for all-fail.
-    assert aggregate_exit_code(results) == EXIT_AUTH_ERROR
+    assert aggregate_exit_code(results) == EXIT_PARTIAL_FAILURE
+
+
+def test_aggregate_exit_code_all_fail_three_distinct_reasons_returns_seven() -> None:
+    """Three failures with three distinct codes also collapse to 7."""
+    results = [
+        _fail("a", EXIT_AUTH_ERROR, "auth_failed"),
+        _fail("b", EXIT_NETWORK_ERROR, "network_error"),
+        _fail("c", EXIT_DEVICE_ERROR, "device_error"),
+    ]
+    assert aggregate_exit_code(results) == EXIT_PARTIAL_FAILURE
 
 
 # --- run_parallel core behavior ----------------------------------------------
@@ -147,21 +161,26 @@ async def test_run_parallel_all_fail_same_reason_returns_that_reason_code() -> N
 
 
 @pytest.mark.asyncio
-async def test_run_parallel_all_fail_different_reasons_returns_first() -> None:
-    """All fail, different reasons -> first task's code (FR-29a)."""
+async def test_run_parallel_all_fail_different_reasons_returns_seven() -> None:
+    """All fail, different reasons -> 7 per SRD §11.1 closing paragraph.
+
+    Mixed-failure-reasons collapse to ``EXIT_PARTIAL_FAILURE`` regardless of
+    completion order; the structured stderr summary (caller-emitted) is what
+    names the dominant failure mode.
+    """
     seen: list[str] = []
 
     async def _fn(t: str) -> TaskResult:
         seen.append(t)
         if t == "a":
-            # Slow this one down so completion order is deterministic.
+            # Slow this one down deliberately — completion order MUST NOT
+            # affect the aggregate exit code.
             await asyncio.sleep(0.05)
             return _fail(t, EXIT_AUTH_ERROR, "auth_failed")
         return _fail(t, EXIT_NETWORK_ERROR, "network_error")
 
     agg = await run_parallel(["a", "b"], _fn, concurrency=2)
-    # First completed failure is "b" (auth was delayed). Its code wins.
-    assert agg.exit_code == EXIT_NETWORK_ERROR
+    assert agg.exit_code == EXIT_PARTIAL_FAILURE
     assert agg.failures == 2
 
 

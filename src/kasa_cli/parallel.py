@@ -9,7 +9,9 @@ with consistent semantics for:
 * per-task structured-error reporting (SRD §11.2),
 * graceful drain on SIGINT/SIGTERM (FR-31c — stop dispatching, wait up to 2s
   for in-flight tasks),
-* aggregate exit-code rules (FR-29a / FR-31a — 0 / 7 / first-failure-code).
+* aggregate exit-code rules (FR-29a / FR-31a / SRD §11.1 — 0; 7 for partial
+  or mixed-reason failures; the shared reason's code for homogeneous
+  all-failure).
 
 API contract for callers
 ------------------------
@@ -60,9 +62,11 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import sys
+from collections import Counter
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Final, cast
+from typing import Final, TextIO, cast
 
 from kasa_cli.errors import (
     EXIT_DEVICE_ERROR,
@@ -76,6 +80,8 @@ __all__ = [
     "AggregateResult",
     "TaskResult",
     "aggregate_exit_code",
+    "build_aggregate_summary_error",
+    "emit_aggregate_summary_to_stderr",
     "run_parallel",
 ]
 
@@ -111,18 +117,16 @@ class TaskResult:
 class AggregateResult:
     """The aggregate of every :class:`TaskResult` in a parallel run.
 
-    Exit-code rules (FR-29a / FR-31a):
+    Exit-code rules (FR-29a / FR-31a / SRD §11.1 closing paragraph):
         * ``0`` if every task succeeded.
         * ``7`` (partial failure) if at least one succeeded AND at least one
           failed.
-        * Otherwise (every task failed) the exit code of the FIRST failure —
-          so all-unreachable returns ``3``, all-unauthorized returns ``2``,
-          and a homogeneous failure surfaces correctly.
-
-    Mixed-failure-reasons (e.g. some unreachable, some auth-rejected, none
-    succeeded) is intentionally NOT 7 here — it's the first-failure code by
-    spec. The structured stderr summary (emitted by the caller, not us) is
-    where mixed failure modes get described.
+        * If every task failed for the **same** reason, the shared reason's
+          exit code (e.g. all-unreachable returns ``3``, all-unauthorized
+          returns ``2``).
+        * If every task failed for **different** reasons (mixed failure
+          reasons), the exit code is ``7`` per SRD §11.1; the structured
+          stderr summary names the dominant failure.
     """
 
     results: tuple[TaskResult, ...]
@@ -154,6 +158,15 @@ def aggregate_exit_code(results: list[TaskResult] | tuple[TaskResult, ...]) -> i
     Public so callers can re-derive an exit code without rebuilding an
     :class:`AggregateResult` (e.g. ``cli.py`` rolling up an early-return after
     `--concurrency 0` was passed). Empty input is ``0`` per FR-31b.
+
+    SRD §11.1 closing paragraph rules:
+
+    * Empty results -> 0.
+    * All success -> 0.
+    * Some success, some failure -> 7 (partial failure).
+    * All failure, **homogeneous reasons** -> the shared reason's exit code.
+    * All failure, **mixed reasons** -> 7 (partial failure); the structured
+      stderr summary names the dominant failure.
     """
     if not results:
         return EXIT_SUCCESS
@@ -165,8 +178,12 @@ def aggregate_exit_code(results: list[TaskResult] | tuple[TaskResult, ...]) -> i
         return EXIT_SUCCESS
     if successes > 0:
         return EXIT_PARTIAL_FAILURE
-    # All failed — first failure's code wins (FR-29a homogeneous-failure rule).
-    return results[0].exit_code
+    # All failed. Homogeneous reason -> that reason's code.
+    # Mixed reasons -> EXIT_PARTIAL_FAILURE per SRD §11.1.
+    failure_codes = {r.exit_code for r in results if not r.success}
+    if len(failure_codes) == 1:
+        return next(iter(failure_codes))
+    return EXIT_PARTIAL_FAILURE
 
 
 async def run_parallel(
@@ -205,8 +222,9 @@ async def run_parallel(
     Returns:
         AggregateResult: ``results`` is in completion order (NOT input order)
         because per-task streaming via ``on_each`` is the canonical
-        observable; the aggregate exit code uses the first-completed
-        failure's code, which matches the per-stream observable order.
+        observable. The aggregate exit code follows :func:`aggregate_exit_code`
+        — homogeneous all-failure surfaces the shared reason's code; mixed
+        all-failure (or any partial failure) surfaces ``7`` per SRD §11.1.
     """
     # Empty input — FR-31b's "empty batch exits 0" lives at the verb layer,
     # but we honor it here too for symmetry.
@@ -402,3 +420,109 @@ async def run_parallel(
         failures=failures,
         exit_code=exit_code,
     )
+
+
+# ---------------------------------------------------------------------------
+# FR-35a aggregate summary -> stderr (SRD §11.2)
+# ---------------------------------------------------------------------------
+
+
+def build_aggregate_summary_error(
+    agg: AggregateResult,
+    *,
+    total_inputs: int | None = None,
+) -> StructuredError | None:
+    """Build the SRD §11.2 stderr summary error for a non-zero aggregate.
+
+    Returns ``None`` when the aggregate succeeded (caller should not emit).
+
+    Shape selection (SRD §11.1 closing paragraph):
+
+    * Some success + some failure -> ``error="partial_failure"``,
+      ``exit_code=7``, message names success/failure counts.
+    * All failure, **homogeneous** reason -> ``error=<that reason>``,
+      ``exit_code=<that reason's code>``, message names the count.
+    * All failure, **mixed** reasons -> ``error="partial_failure"``,
+      ``exit_code=7``, message names the dominant failure.
+    * Zero results (vacuous failure: e.g. dispatch was halted before any
+      task ran) -> ``error="partial_failure"``, ``exit_code=7``, message
+      records the truncation.
+
+    ``total_inputs``, when supplied, lets the caller distinguish "we
+    received N inputs but only saw M results" (relevant when the engine
+    short-circuited dispatch) from a clean run of M inputs.
+    """
+    if agg.exit_code == EXIT_SUCCESS:
+        return None
+
+    successes = agg.successes
+    failures = agg.failures
+    n_total = total_inputs if total_inputs is not None else (successes + failures)
+
+    # Vacuous-failure shape (no results recorded but we still exited non-zero).
+    if successes == 0 and failures == 0:
+        return StructuredError(
+            error="partial_failure",
+            exit_code=EXIT_PARTIAL_FAILURE,
+            message=(
+                f"Aggregate run produced no results (expected {n_total} target(s)); "
+                "exit code reflects truncation."
+            ),
+        )
+
+    if successes > 0 and failures > 0:
+        return StructuredError(
+            error="partial_failure",
+            exit_code=EXIT_PARTIAL_FAILURE,
+            message=(f"{failures} of {n_total} target(s) failed; {successes} succeeded."),
+        )
+
+    # All failed.
+    failure_codes = {r.exit_code for r in agg.results if not r.success}
+    failure_names = [r.error.error for r in agg.results if r.error is not None]
+    if len(failure_codes) == 1:
+        sole_code = next(iter(failure_codes))
+        # Pick a single error name if uniform; else fall back to device_error.
+        unique_names = set(failure_names)
+        err_name = next(iter(unique_names)) if len(unique_names) == 1 else "device_error"
+        return StructuredError(
+            error=err_name,
+            exit_code=sole_code,
+            message=f"All {failures} target(s) failed with the same reason ({err_name}).",
+        )
+
+    # Mixed failure reasons -> exit 7, name dominant failure.
+    counter = Counter(failure_names)
+    if counter:
+        dominant_name, dominant_count = counter.most_common(1)[0]
+    else:  # pragma: no cover — defensive
+        dominant_name, dominant_count = "device_error", failures
+    return StructuredError(
+        error="partial_failure",
+        exit_code=EXIT_PARTIAL_FAILURE,
+        message=(
+            f"All {failures} target(s) failed with mixed reasons; "
+            f"dominant: {dominant_name} ({dominant_count} of {failures})."
+        ),
+    )
+
+
+def emit_aggregate_summary_to_stderr(
+    agg: AggregateResult,
+    *,
+    total_inputs: int | None = None,
+    stream: TextIO | None = None,
+) -> None:
+    """Emit the FR-35a / SRD §11.2 aggregate summary to stderr (one line).
+
+    No-op when ``agg.exit_code == EXIT_SUCCESS``. Callers MUST suppress this
+    when their run was interrupted by SIGINT/SIGTERM — the FR-31c
+    interrupted-summary line on stdout already covers that case.
+    """
+    err = build_aggregate_summary_error(agg, total_inputs=total_inputs)
+    if err is None:
+        return
+    target_stream = stream if stream is not None else sys.stderr
+    target_stream.write(err.to_json())
+    target_stream.write("\n")
+    target_stream.flush()

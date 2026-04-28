@@ -609,6 +609,68 @@ def test_group_target_json_mode_emits_array(
     assert all(p["success"] for p in parsed)
 
 
+# --- R1 / FR-35a stderr summary on groups fanout ----------------------------
+
+
+def test_group_fanout_partial_failure_emits_stderr_summary(
+    group_config: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    make_device: Callable[..., Any],
+) -> None:
+    """A mixed-success/failure @group fanout writes one §11.2 line on stderr.
+
+    SRD §5.10 FR-35a: structured summary on stderr for non-zero aggregates.
+    """
+
+    async def _fake_connect(*_args: Any, **kwargs: Any) -> Any:
+        host = kwargs.get("host") or (kwargs.get("config") and kwargs["config"].host)
+        if str(host).endswith(".2"):
+            from kasa.exceptions import TimeoutError as KasaTimeoutError
+
+            raise KasaTimeoutError("simulated unreachable")
+        return make_device(alias=str(host), host=str(host), model="HS100", is_on=False)
+
+    monkeypatch.setattr("kasa.Device.connect", _fake_connect)
+    monkeypatch.delenv("KASA_CLI_CONFIG", raising=False)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli_main,
+        ["--config", str(group_config), "--jsonl", "on", "@bedroom-lights"],
+    )
+    assert result.exit_code == 7
+    err_lines = [ln for ln in result.stderr.splitlines() if ln.strip()]
+    # Exactly one §11.2 summary line on stderr.
+    assert len(err_lines) == 1, f"expected 1 stderr summary, got: {err_lines!r}"
+    summary = json.loads(err_lines[0])
+    assert summary["error"] == "partial_failure"
+    assert summary["exit_code"] == 7
+
+
+def test_group_fanout_all_success_no_stderr_summary(
+    group_config: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    make_device: Callable[..., Any],
+) -> None:
+    """All-success @group fanout produces ZERO stderr summary lines."""
+
+    async def _fake_connect(*_args: Any, **kwargs: Any) -> Any:
+        host = kwargs.get("host") or (kwargs.get("config") and kwargs["config"].host)
+        return make_device(alias=str(host), host=str(host), model="HS100", is_on=False)
+
+    monkeypatch.setattr("kasa.Device.connect", _fake_connect)
+    monkeypatch.delenv("KASA_CLI_CONFIG", raising=False)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli_main,
+        ["--config", str(group_config), "--jsonl", "on", "@bedroom-lights"],
+    )
+    assert result.exit_code == 0
+    err_lines = [ln for ln in result.stderr.splitlines() if ln.strip()]
+    assert err_lines == []
+
+
 # --- Suppress unused-import lint --------------------------------------------
 
 _ = (time,)  # silence; available for future timing-based assertions

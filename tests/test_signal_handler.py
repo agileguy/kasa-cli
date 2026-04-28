@@ -211,28 +211,34 @@ def test_sigint_completed_lines_emitted_before_interrupted_summary(
     sys.platform == "win32",
     reason="POSIX signal semantics — not portable to Windows.",
 )
-def test_signal_during_already_complete_batch_does_not_corrupt_exit(
+def test_tiny_batch_exits_zero(
     tmp_path: Any,
 ) -> None:
-    """Sending a signal AFTER the batch finishes leaves exit 0 untouched.
+    """A tiny one-line batch with a short fake sleep exits 0 cleanly.
 
-    Edge case: a tiny batch (1 line, 50ms sleep) completes well before we
-    send the signal. The process should already have exited 0 by then. We
-    tolerate either "process already gone" (proc.poll() is 0) or a clean
-    drain (130) — but the result must NOT be a corrupted code.
+    Sanity check that the FAKE_SLEEP test hatch runs end-to-end. The
+    original intent of this test was "signal AFTER the batch finishes
+    leaves exit 0 untouched", but that scenario is fundamentally racy in
+    subprocess testing: by the time we try to ``send_signal``, the process
+    has either already exited (the signal targets a non-existent pid and
+    raises ProcessLookupError) or it hasn't, depending on scheduler
+    timing. The original implementation accordingly never actually called
+    ``proc.send_signal()`` — it just ran a tiny batch and asserted
+    exit 0, which is what this renamed test does deliberately.
+
+    The interesting "in-flight signal" cases are covered by the three
+    SIGINT/SIGTERM-during-batch tests above; this test exists only to
+    confirm the normal-path tiny-batch flow stays clean.
     """
     p = tmp_path / "tiny.batch"
     p.write_text("on alias-0\n")
     proc = _spawn_batch(p, fake_sleep_seconds=0.05)
-    # Wait long enough for the batch to finish naturally.
     try:
         stdout, stderr = proc.communicate(timeout=4)
     finally:
         if proc.poll() is None:
             proc.kill()
             proc.wait(timeout=3)
-    # Either the batch finished (exit 0) before we even tried to interrupt,
-    # which is the expected normal case.
     assert proc.returncode == 0, (
         f"unexpected exit code {proc.returncode!r}; stdout={stdout!r}; stderr={stderr!r}"
     )

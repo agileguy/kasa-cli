@@ -1425,6 +1425,7 @@ def _dispatch_target_or_group(
 
     members = _resolve_group_members(target, cfg)
     concurrency = _resolve_concurrency(state, cfg)
+    n_members = len(members)
 
     async def _runner() -> int:
         async def _per_target(member: str) -> _TaskResult:
@@ -1455,6 +1456,10 @@ def _dispatch_target_or_group(
                 concurrency=concurrency,
                 on_each=_on_each,
             )
+            # FR-35a: one structured §11.2 summary on stderr for non-zero
+            # aggregates so operators see WHY the exit code is non-zero
+            # without having to scan the per-line stream.
+            _parallel.emit_aggregate_summary_to_stderr(agg, total_inputs=n_members)
             return agg.exit_code
 
         if mode is OutputMode.JSON:
@@ -1469,15 +1474,18 @@ def _dispatch_target_or_group(
                 mode,
                 formatter=_task_result_to_text,
             )
+            _parallel.emit_aggregate_summary_to_stderr(agg, total_inputs=n_members)
             return agg.exit_code
 
-        # QUIET — just compute the aggregate; nothing to stdout.
+        # QUIET — just compute the aggregate; nothing to stdout. The summary
+        # still goes to stderr so the operator can see the failure shape.
         agg = await _parallel.run_parallel(
             members,
             _per_target,
             concurrency=concurrency,
             on_each=None,
         )
+        _parallel.emit_aggregate_summary_to_stderr(agg, total_inputs=n_members)
         return agg.exit_code
 
     return _run_async(_runner, mode=mode)

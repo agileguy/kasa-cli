@@ -116,30 +116,70 @@ def _make_lookup(
     return _identity
 
 
-def _parse_kv_flags(argv: list[str], allowed: set[str]) -> dict[str, str]:
+def _parse_kv_flags(
+    argv: list[str],
+    allowed: set[str],
+    *,
+    bare_flags: dict[str, str] | None = None,
+) -> dict[str, str]:
     """Parse ``--key value`` / ``--key=value`` pairs out of ``argv``.
 
     Returns a dict of {name → value}. Unknown flags raise UsageError. Bare
     positional tokens are returned via the special key ``"_pos"`` (a
     space-joined list isn't useful here — callers want the first one).
+
+    Args:
+        argv: The tokens after the verb name.
+        allowed: Flags that take a value (``--key value`` or
+            ``--key=value``).
+        bare_flags: Optional mapping of bare-flag name -> normalized
+            destination spec ``"<dest>=<value>"``. Use this for boolean
+            toggles like ``--cumulative`` (sets ``cumulative=true``) and
+            ``--no-cumulative`` (sets ``cumulative=false``). When a
+            bare-flag name appears with an attached ``=value`` form, that
+            wins (e.g. ``--cumulative=false`` overrides the implied
+            ``true``); when it appears bare, the spec's value is used.
     """
+    bare_flags = bare_flags or {}
     result: dict[str, str] = {}
     positional: list[str] = []
     i = 0
     while i < len(argv):
         tok = argv[i]
         if tok.startswith("--"):
-            name, _, inline_val = tok[2:].partition("=")
-            if name not in allowed:
+            name, sep, inline_val = tok[2:].partition("=")
+            in_value_flags = name in allowed
+            in_bare_flags = name in bare_flags
+            if not in_value_flags and not in_bare_flags:
+                hint_allowed = sorted(set(allowed) | set(bare_flags))
                 raise UsageError(
                     f"unknown flag --{name} in batch line",
-                    hint=f"allowed: {sorted(allowed)}",
+                    hint=f"allowed: {hint_allowed}",
                 )
-            if inline_val:
+            # Bare-flag form (no ``=``).
+            if not sep and in_bare_flags:
+                # E.g. ``--cumulative`` -> bare_flags["cumulative"] is
+                # "cumulative=true"; ``--no-cumulative`` is
+                # "cumulative=false". Splitting once on ``=`` gives the
+                # destination key + normalized value.
+                spec = bare_flags[name]
+                dest, _, dest_val = spec.partition("=")
+                result[dest] = dest_val
+                i += 1
+                continue
+            # Inline-value form (``--key=value``).
+            if sep:
+                # Bare-flag aliases never accept inline values
+                # (``--no-cumulative=true`` is nonsense — reject).
+                if in_bare_flags and not in_value_flags:
+                    raise UsageError(
+                        f"--{name} does not accept a value",
+                        hint=f"use bare --{name} or its inverse",
+                    )
                 result[name] = inline_val
                 i += 1
                 continue
-            # Consume the next token as the value.
+            # Space-separated value form (``--key value``).
             if i + 1 >= len(argv):
                 raise UsageError(f"--{name} requires a value")
             result[name] = argv[i + 1]
@@ -317,7 +357,17 @@ async def _dispatch_line(
         if verb == "energy":
             from kasa_cli.verbs.energy_cmd import run_energy
 
-            flags = _parse_kv_flags(line.argv, allowed={"socket", "cumulative"})
+            # ``--cumulative`` and ``--no-cumulative`` are bare boolean
+            # toggles; ``--cumulative=true|false`` (with ``=``) is also
+            # accepted for explicit value form. Default is True.
+            flags = _parse_kv_flags(
+                line.argv,
+                allowed={"socket", "cumulative"},
+                bare_flags={
+                    "cumulative": "cumulative=true",
+                    "no-cumulative": "cumulative=false",
+                },
+            )
             target = flags.get("_pos")
             if not target:
                 raise UsageError(f"energy: missing target alias on line {line.lineno}")
@@ -345,7 +395,12 @@ async def _dispatch_line(
         )
 
     except KasaCliError as exc:
-        target = exc.target or line.argv[0] if line.argv else line.verb
+        # Operator precedence: prefer the exception's explicit target; fall
+        # back to the first positional, then the verb name. Parentheses are
+        # load-bearing — without them the expression collapses to
+        # ``(exc.target or line.argv[0]) if line.argv else line.verb`` and
+        # silently drops ``exc.target`` when ``argv`` is empty.
+        target = exc.target or (line.argv[0] if line.argv else line.verb)
         return _kasa_error_to_task_result(target or line.verb, exc)
     except Exception as exc:  # pragma: no cover — last-ditch defensive net
         target = line.argv[0] if line.argv else line.verb
@@ -437,21 +492,32 @@ def _emit_interrupted_summary(
 def _flush_token_cache_pending() -> None:
     """FR-31c step 4: flush token cache to disk for any pending sessions.
 
-    Phase 2's auth_cache.save_session is called eagerly at result-receive
-    time inside the wrapper layer, so there is no "pending session" registry
-    to flush at this point — every successful auth has already been
-    persisted. We keep the hook in place because A3's parallel.py overwrite
-    or a future phase might add registry-based pending-session tracking; if
-    so, this helper is the single place the CLI calls into ``auth_cache``
-    for the drain path.
+    This is intentionally a no-op. Phase 2's :func:`auth_cache.save_session`
+    is called eagerly at result-receive time inside the wrapper layer (and
+    fsyncs before the rename), so by the time SIGINT/SIGTERM lands every
+    successful auth has already been persisted to disk. There is no
+    in-memory buffer / pending-session registry to flush.
+
+    We keep the hook in place because:
+
+    1. A future phase might add registry-based pending-session tracking;
+       if so, this is the single point where the CLI calls into
+       ``auth_cache`` for the drain path.
+    2. The hook documents the FR-31c step 4 contract at the call site
+       inside :func:`run_batch`.
+
+    The "eager save_session, no buffering" invariant is verified by
+    ``tests/test_verbs_batch.py::
+    test_auth_cache_has_no_in_memory_buffer_state`` — if a future change
+    introduces a buffer that needs flushing, that test will fail and force
+    this helper to grow a real implementation.
     """
-    # No-op for now. Intentionally swallows any error: token-flush failures
-    # MUST NOT prevent the process from exiting cleanly with 130/143.
+    # No-op. Intentionally swallows any error: token-flush failures MUST
+    # NOT prevent the process from exiting cleanly with 130/143.
     try:
-        # If a future phase adds e.g. ``auth_cache.flush_pending()``, call
-        # it here. Right now ``save_session`` is the public write API and
-        # callers invoke it directly.
-        _ = auth_cache  # keep the import warm so static analysis sees it
+        # Keep the import warm so static analysis sees it; if a future phase
+        # adds e.g. ``auth_cache.flush_pending()``, call it here.
+        _ = auth_cache
     except Exception:  # pragma: no cover — defensive
         return
 
@@ -574,7 +640,10 @@ async def run_batch(
 
     # If the stop_event fired but we drained successfully, emit the summary
     # but still return the aggregate exit code (the CLI overrides with
-    # 130/143 once it sees ``stop_event.is_set()``).
+    # 130/143 once it sees ``stop_event.is_set()``). The FR-31c interrupted
+    # summary on stdout is the authoritative end-of-run record on the
+    # interrupt path; we deliberately do NOT also emit the FR-35a stderr
+    # summary here so operators don't see two competing summaries.
     if interrupted or (stop_event is not None and stop_event.is_set()):
         completed = len(streamed)
         pending = max(0, len(parsed_lines) - completed)
@@ -592,6 +661,9 @@ async def run_batch(
 
     # Normal completion: emit the JSON-array tail in --json mode and return.
     _emit_collected(streamed, mode=mode, stream=out)
+    # FR-35a: one structured §11.2 summary on stderr when the aggregate is
+    # non-zero, regardless of mode (operators always need to know why).
+    parallel.emit_aggregate_summary_to_stderr(aggregate, total_inputs=len(parsed_lines))
     return aggregate.exit_code
 
 
